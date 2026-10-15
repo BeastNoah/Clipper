@@ -107,6 +107,35 @@ def test_ui_api(server):
     status, body, _ = call(port, "GET", f"/media/{vid}/output/{clip['file']}")
     assert status == 200 and len(body) > 10000
 
+    # fix a misheard word in the captions, which re-renders the clip with the correction
+    status, caps, _ = call(port, "GET", f"/api/videos/{vid}/captions/1")
+    assert status == 200 and not caps["edited"] and caps["lines"][0]["text"].startswith("This is spoken")
+    lines = caps["lines"]
+    lines[0]["text"] = lines[0]["text"].replace("spoken", "Spoken-Word")
+    status, job, _ = call(port, "POST", f"/api/videos/{vid}/captions/1",
+                          {"lines": lines, "options": {"caption_model": "none", "preset": "ultrafast"}})
+    assert status == 201
+    job = wait(port, job["id"])
+    assert job["state"] == "done", job
+    assert any("using your corrections" in line for line in job["log"])
+    ass = next(work.glob("clips/*/9x16/captions.ass")).read_text()
+    assert "Spoken-Word" in ass
+    assert call(port, "GET", f"/api/videos/{vid}/captions/1")[1]["edited"] is True
+    status, job, _ = call(port, "POST", f"/api/videos/{vid}/captions/1",
+                          {"reset": True, "options": {"caption_model": "none", "preset": "ultrafast"}})
+    assert wait(port, job["id"])["state"] == "done"
+    assert "Spoken-Word" not in next(work.glob("clips/*/9x16/captions.ass")).read_text()
+    assert call(port, "GET", f"/api/videos/{vid}/captions/9")[0] == 404
+
+
+def wait(port, job_id):
+    for _ in range(240):
+        job = call(port, "GET", f"/api/jobs/{job_id}")[1]
+        if job["state"] not in ("queued", "running"):
+            return job
+        time.sleep(0.25)
+    return job
+
 
 def test_phone_mode_needs_the_key(tmp_path):
     from clipper.ui.server import lan_ip, phone_key

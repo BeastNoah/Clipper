@@ -70,6 +70,12 @@ if "<clips>" in prompt:
                        "duplicate_of": ids[0] if dup and k == 1 else None}
                       for k, c in enumerate(ids)]})
 
+if "<lines>" in prompt:
+    body = prompt.split("<lines>")[1].split("</lines>")[0]
+    lines = [re.sub(r"^\d+\. ", "", l) for l in body.strip().splitlines()]
+    title = re.search(r"^Title: (.*)$", prompt, re.M)[1]
+    reply({"title": f"[EN] {title}", "lines": [f"[EN] {l}" for l in lines]})
+
 if '<clip id="' in prompt:
     lo, hi = map(float, re.search(r"make it (\d+)-(\d+) seconds", prompt).groups())
     trims = []

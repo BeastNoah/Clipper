@@ -35,12 +35,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--min-len", type=float, default=d.min_len, help="shortest clip in seconds (default 20)")
     g.add_argument("--max-len", type=float, default=d.max_len, help="longest clip in seconds (default 60)")
     g.add_argument("--model", default=d.model, help="Claude model that picks the clips (default opus)")
+    g.add_argument("--prompt", default=None, metavar="TEXT",
+                   help="what Claude should look for, e.g. 'funny moments' or 'everything about pricing'")
+    g.add_argument("--from", dest="range_start", default=None, metavar="TIME",
+                   help="only use the video from this time on (seconds, 12:30 or 1:02:03)")
+    g.add_argument("--to", dest="range_end", default=None, metavar="TIME", help="only use the video up to this time")
     g = p.add_argument_group("speech")
     g.add_argument("--whisper-model", default=d.whisper_model,
                    help="model for the full transcript: tiny, base, small, medium, large-v3, turbo (default small)")
     g.add_argument("--caption-model", default=d.caption_model,
                    help="bigger model that re-transcribes just the chosen clips for accurate captions, "
                         "or 'none' (default turbo)")
+    g.add_argument("--caption-language", default=None, metavar="LANG",
+                   help="translate the captions, e.g. en or German (also writes a translated .srt)")
     g.add_argument("--whisper-backend", default=d.whisper_backend, choices=("auto", "faster-whisper", "mlx"),
                    help="auto uses mlx-whisper on Apple Silicon when installed (default auto)")
     g.add_argument("--language", default=None, help="spoken language code, e.g. en or de (default: detect)")
@@ -52,6 +59,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--uppercase", action="store_true", help="captions in capital letters")
     g.add_argument("--caption-position", default=d.caption_position, choices=("lower", "middle"))
     g.add_argument("--no-title", action="store_true", help="don't show the clip title at the start")
+    g.add_argument("--format", dest="formats", default="9:16", metavar="RATIOS",
+                   help="output shapes, comma separated: 9:16, 4:5, 1:1, 16:9 (default 9:16)")
+    g.add_argument("--no-zoom", action="store_true", help="no automatic zoom-ins on the hook and keywords")
+    g.add_argument("--progress-bar", action="store_true", help="a progress bar along the top")
+    g.add_argument("--logo", default=None, metavar="FILE", help="your logo on every clip (PNG with transparency)")
+    g.add_argument("--logo-position", default=d.logo_position,
+                   choices=("top-left", "top-right", "bottom-left", "bottom-right"))
     g.add_argument("--jump-cuts", default=d.jump_cuts, choices=JUMP_CUT_MODES,
                    help="cut out long pauses and filler words (on), only pauses, or nothing (default on)")
     g.add_argument("--layout", default=d.layout, choices=LAYOUTS,
@@ -77,7 +91,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 def options_from_args(args: argparse.Namespace) -> Options:
     return Options(
         num_clips=args.num_clips, min_len=args.min_len, max_len=args.max_len, work_dir=args.work_dir,
-        download=args.download,
+        download=args.download, prompt=args.prompt, range_start=args.range_start, range_end=args.range_end,
+        caption_language=args.caption_language, formats=args.formats, zoom=not args.no_zoom,
+        progress_bar=args.progress_bar, logo=args.logo, logo_position=args.logo_position,
         model=args.model, whisper_model=args.whisper_model, whisper_backend=args.whisper_backend,
         language=args.language, caption_model=args.caption_model, caption_style=args.caption_style,
         font=args.font, caption_size=args.caption_size, highlight_color=args.highlight_color,

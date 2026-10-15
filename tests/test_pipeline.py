@@ -53,7 +53,7 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
         assert c["post"]["youtube_title"]
 
     # No faces in a test pattern: every shot falls back to the full frame on a blurred background.
-    plan = json.loads(next((work / "clips").glob("*/reframe.json")).read_text())["result"]
+    plan = json.loads(next((work / "clips").glob("*/9x16/reframe.json")).read_text())["result"]
     assert all(s["mode"] == "fit" for s in plan["shots"])
 
     # A rerun asking for fewer clips reuses everything: no new Claude calls, no re-encoding.
@@ -63,3 +63,43 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
     assert len(fake_claude.read_text().splitlines()) == calls
     assert [p.name for p in (work / "output").glob("*.mp4")] == [outputs[0].name]
     assert outputs[0].stat().st_mtime_ns == mtime
+
+
+def test_pipeline_with_formats_translation_logo_and_focus(tmp_path, fake_claude):
+    import cv2
+    import numpy as np
+
+    src = tmp_path / "talk.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=40",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=40", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    logo = np.zeros((30, 60, 4), np.uint8)
+    logo[..., 1:] = 255
+    cv2.imwrite(str(tmp_path / "logo.png"), logo)
+    root = tmp_path / "work"
+    args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "8", "--max-len", "12", "--preset",
+            "ultrafast", "--caption-model", "none", "--format", "9:16,1:1,16:9", "--caption-language", "English",
+            "--logo", str(tmp_path / "logo.png"), "--progress-bar", "--prompt", "the best bits",
+            "--from", "0:10", "--to", "0:38"]
+    assert cli.main(args + ["--stop-after", "ingest"]) == 0
+    (work,) = root.iterdir()
+    meta = json.loads((work / "meta.json").read_text())
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "de", "words": make_words([f"Das ist Satz Nummer {i} heute." for i in range(14)],
+                                                         start=0.5)}})
+    assert cli.main(args) == 0
+    (clip,) = json.loads((work / "output" / "clips.json").read_text())
+    assert clip["start"] >= 9.5
+    sizes = {}
+    for ratio, f in clip["formats"].items():
+        v = video_stream(ffprobe(work / "output" / f["file"]))
+        sizes[ratio] = (v["width"], v["height"])
+    assert sizes == {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080)}
+    srts = [(work / "output" / f).read_text() for f in clip["srt"]]
+    assert len(srts) == 2 and "Das ist Satz" in srts[0] and "[EN]" in srts[1]
+    ass = next((work / "clips").glob("*/9x16/captions.ass")).read_text()
+    assert "[EN]" in ass and "Title,,0,0,0,,{\\fad(150,300)}[EN]" in ass  # translated lines and title
+    prompts = [json.loads(l)["prompt"] for l in fake_claude.read_text().splitlines()]
+    assert any("looking for: the best bits" in p for p in prompts)

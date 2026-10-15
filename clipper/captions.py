@@ -11,8 +11,8 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .edit import EditMap
+from .formats import VERTICAL, Format
 
-OUT_W, OUT_H = 1080, 1920
 MAX_WORDS = 4
 LINE_GAP = 0.6       # a pause this long always starts a new line
 HOLD = 0.3           # how long a line stays up after its last word when nothing follows
@@ -186,12 +186,12 @@ def _ts(t: float) -> str:
 # ---------------------------------------------------------------------------------------------
 # ASS output
 
-def _header(styles: list[str]) -> str:
+def _header(styles: list[str], fmt: Format = VERTICAL) -> str:
     return f"""\
 [Script Info]
 ScriptType: v4.00+
-PlayResX: {OUT_W}
-PlayResY: {OUT_H}
+PlayResX: {fmt.width}
+PlayResY: {fmt.height}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.709
@@ -207,8 +207,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
 
 
-def _caption_style_line(style: CaptionStyle) -> str:
-    align, margin_v = (5, 0) if style.position == "middle" else (2, MARGIN_LOWER)
+def _caption_style_line(style: CaptionStyle, fmt: Format = VERTICAL) -> str:
+    align, margin_v = (5, 0) if style.position == "middle" else (2, fmt.v(MARGIN_LOWER))
     outline_col = ass_color("#000000", 0x50 if style.box else 0)
     return (f"Style: Default,{style.font},{style.size},{ass_color(style.color)},{ass_color(style.color)},"
             f"{outline_col},{ass_color('#000000', 0x80)},-1,0,0,0,100,100,0,0,{3 if style.box else 1},"
@@ -227,12 +227,12 @@ def _escape(text: str) -> str:
 
 
 def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS["bold"],
-              keywords: list[str] | None = None, title: str | None = None) -> str:
+              keywords: list[str] | None = None, title: str | None = None, fmt: Format = VERTICAL) -> str:
     """words have times in the finished clip."""
     emphasized = keyword_positions(words, keywords or [])
     index = {id(w): i for i, w in enumerate(words)}
     hi, em, base = (f"\\c{tag_color(c)}" for c in (style.highlight, style.emphasis, style.color))
-    lines = group_lines(words, style.max_chars)
+    lines = group_lines(words, int(style.max_chars * fmt.width / 1080))
     events = []
     if title:
         fade_out = min(TITLE_SECONDS, duration)
@@ -263,14 +263,14 @@ def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS[
                 else:
                     parts.append(text)
             events.append(f"Dialogue: 0,{_ts(start)},{_ts(end)},Default,,0,0,0,,{' '.join(parts)}")
-    styles = [_caption_style_line(style), _title_style_line(style, "Title", 62, 8, 250)]
-    return _header(styles) + "\n".join(events) + "\n"
+    styles = [_caption_style_line(style, fmt), _title_style_line(style, "Title", 62, 8, fmt.v(250))]
+    return _header(styles, fmt) + "\n".join(events) + "\n"
 
 
-def build_cover_ass(title: str, style: CaptionStyle = PRESETS["bold"]) -> str:
+def build_cover_ass(title: str, style: CaptionStyle = PRESETS["bold"], fmt: Format = VERTICAL) -> str:
     """A big title card for the clip's cover image."""
     event = f"Dialogue: 0,{_ts(0)},{_ts(10)},Cover,,0,0,0,,{_escape(title)}"
-    return _header([_title_style_line(style, "Cover", 96, 5, 0)]) + event + "\n"
+    return _header([_title_style_line(style, "Cover", 96, 5, 0)], fmt) + event + "\n"
 
 
 def _write_if_changed(path: Path, text: str) -> Path:
@@ -280,11 +280,35 @@ def _write_if_changed(path: Path, text: str) -> Path:
     return path
 
 
-def make_captions(clip: dict, words: list[dict], edit: EditMap, clip_dir: Path, style: CaptionStyle,
-                  title_overlay: bool = True) -> Path:
-    """Write captions.ass for the clip (cheap, so it's rebuilt every run; unchanged files are left alone)."""
-    mapped = map_words(words, clip["start"], edit)
-    title = clip["title"] if title_overlay else None
-    ass = build_ass(mapped, edit.duration, style, clip.get("keywords"), title)
-    _write_if_changed(clip_dir / "cover.ass", build_cover_ass(clip["title"], style))
-    return _write_if_changed(clip_dir / "captions.ass", ass)
+def make_captions(words: list[dict], duration: float, out_dir: Path, style: CaptionStyle, fmt: Format = VERTICAL,
+                  title: str | None = None, cover_title: str = "", keywords: list[str] | None = None) -> Path:
+    """Write captions.ass (and cover.ass) for one clip in one format. `words` have times in the finished
+    clip. Cheap, so it's rebuilt every run; unchanged files are left alone so renders stay cached."""
+    _write_if_changed(out_dir / "cover.ass", build_cover_ass(cover_title or title or "", style, fmt))
+    return _write_if_changed(out_dir / "captions.ass", build_ass(words, duration, style, keywords, title, fmt))
+
+
+def srt_lines(words: list[dict], max_chars: int = 42) -> list[tuple[float, float, str]]:
+    """Subtitle lines for a .srt file: sentences, split to at most max_chars characters."""
+    out = []
+    for phrase in _phrases(words):
+        line: list[dict] = []
+        for w in phrase:
+            if line and len(" ".join(x["w"] for x in line + [w])) > max_chars:
+                out.append((line[0]["s"], line[-1]["e"], " ".join(x["w"] for x in line)))
+                line = []
+            line.append(w)
+        if line:
+            out.append((line[0]["s"], line[-1]["e"], " ".join(x["w"] for x in line)))
+    return out
+
+
+def build_srt(words: list[dict]) -> str:
+    def ts(t: float) -> str:
+        ms = int(round(max(t, 0.0) * 1000))
+        h, ms = divmod(ms, 3600000)
+        m, ms = divmod(ms, 60000)
+        s, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    return "".join(f"{n}\n{ts(a)} --> {ts(b)}\n{text}\n\n" for n, (a, b, text) in enumerate(srt_lines(words), 1))

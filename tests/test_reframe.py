@@ -1,7 +1,9 @@
 import numpy as np
 
 from clipper.reframe import build_tracks, camera_path, crop_width, detect_cuts, main_track
-from clipper.render import OUT_H, OUT_W, crop_frame, fit_frame
+from clipper.render import crop_frame, fit_frame
+
+OUT_W, OUT_H = 1080, 1920
 
 
 def test_crop_width():

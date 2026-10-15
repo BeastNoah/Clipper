@@ -117,7 +117,7 @@ def make_chunks(sentences: list[Sentence], overlap: float,
     t0, t1 = sentences[0].start, sentences[-1].end
     total = t1 - t0
     if total <= chunk_seconds * 1.1:
-        return [(0, len(sentences) - 1)]
+        return [(sentences[0].i, sentences[-1].i)]
     overlap = min(overlap, chunk_seconds / 2)
     n = math.ceil((total - overlap) / (chunk_seconds - overlap))
     length = (total + (n - 1) * overlap) / n
@@ -358,7 +358,8 @@ noticeably louder than usual; [+1.8s non-speech sound] means a sound without spe
 
 
 def _proposal_prompt(title: str, tl: Timeline, a: int, b: int, count: int, min_len: float,
-                     max_len: float, avoid: list[tuple[float, float]], cues: dict[int, str]) -> str:
+                     max_len: float, avoid: list[tuple[float, float]], cues: dict[int, str],
+                     focus: str | None = None) -> str:
     lines = "\n".join(f"{s.start:.1f}-{s.end:.1f} | {s.text}{cues.get(s.i, '')}" for s in tl.sentences[a:b + 1])
     has_cues = any(i in cues for i in range(a, b + 1))
     lo, hi = tl.sentences[a].start, tl.sentences[b].end
@@ -368,9 +369,13 @@ def _proposal_prompt(title: str, tl: Timeline, a: int, b: int, count: int, min_l
         avoid_txt = ("\nThese time ranges are already taken. Do not propose anything that overlaps them:\n"
                      f"{spans}\n")
     target = round((min_len + max_len) / 2)
+    focus_txt = ""
+    if focus:
+        focus_txt = (f"\nThe person making the clips is looking for: {focus.strip()}\nOnly propose moments that "
+                     "fit this. If nothing in this part fits, return an empty list.\n")
     return f"""\
 Video title: {title}
-
+{focus_txt}
 Below is the transcript from {fmt_time(lo)} to {fmt_time(hi)}. Each line is one sentence: its \
 start and end time in seconds, then the text.
 
@@ -398,7 +403,9 @@ Reply with only a JSON object in exactly this format:
 in the captions."""
 
 
-def _rescore_prompt(title: str, cands: list[dict]) -> str:
+def _rescore_prompt(title: str, cands: list[dict], focus: str | None = None) -> str:
+    focus_txt = (f"\n\nThe person making the clips is looking for: {focus}. Clips that don't fit this "
+                 "should score low.") if focus else ""
     blocks = "\n\n".join(
         f"[{c['id']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} ({c['end'] - c['start']:.0f}s) "
         f"\"{c['title']}\"\n{c['text']}"
@@ -409,7 +416,7 @@ Video title: {title}
 
 These candidate clips come from different parts of the same video. They were scored separately, \
 so their scores are not comparable. Score all of them again on one common scale, comparing them \
-with each other.
+with each other.{focus_txt}
 
 {RUBRIC}
 
@@ -449,7 +456,8 @@ Reply with only a JSON object with one entry per clip, in exactly this format:
 
 class Selector:
     def __init__(self, work: Path, meta: dict, transcript: dict, *, min_len: float, max_len: float,
-                 model: str, claude_factory: Callable[[], Claude], force: bool = False):
+                 model: str, claude_factory: Callable[[], Claude], force: bool = False,
+                 focus: str | None = None, time_range: tuple[float | None, float | None] = (None, None)):
         words = transcript["words"]
         self.sentences = split_sentences(words)
         if not self.sentences:
@@ -458,12 +466,19 @@ class Selector:
         self.cues = sentence_cues(Loudness.from_work(work), words, self.sentences, meta["duration"])
         self.title = meta.get("title", "")
         self.min_len, self.max_len = min_len, max_len
-        self.chunks = make_chunks(self.sentences, overlap=max_len + 30)
+        lo, hi = time_range
+        pool = [s for s in self.sentences
+                if (lo is None or s.start >= lo - 0.5) and (hi is None or s.end <= hi + 0.5)]
+        if not pool:
+            raise ClipperError(f"No speech between {fmt_time(lo or 0)} and {fmt_time(hi or meta['duration'])}.")
+        self.focus = (focus or "").strip() or None
+        self.chunks = make_chunks(pool, overlap=max_len + 30)
         self._claude_factory, self._claude = claude_factory, None
         self._pending: list[tuple[dict, str, int, int]] = []
         self.path = work / "select.json"
         params = {"version": SELECT_VERSION, "transcript": fingerprint(words), "min_len": min_len,
-                  "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks]}
+                  "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks],
+                  "focus": self.focus}
         state = read_json(self.path) if self.path.exists() and not force else None
         if not state or state.get("params") != params:
             state = {"params": params, "done": [], "candidates": [], "rescored": {}}
@@ -558,7 +573,7 @@ class Selector:
             where = f"chunk {k + 1}/{len(self.chunks)}" if len(self.chunks) > 1 else "transcript"
             log(f"select: asking Claude for up to {count} clips ({where}, {fmt_time(lo)}-{fmt_time(hi)})")
             prompt = _proposal_prompt(self.title, self.tl, a, b, count, self.min_len, self.max_len, avoid,
-                                      self.cues)
+                                      self.cues, self.focus)
             proposals = self.claude.ask(SYSTEM_PROMPT, prompt, lambda r: parse_proposals(r, lo, hi),
                                         what=f"proposals for {where}")
             for p in proposals[:count]:
@@ -576,7 +591,7 @@ class Selector:
         if scores is None:
             log(f"select: asking Claude to re-score all {len(cands)} candidates on one scale")
             ids = [c["id"] for c in cands]
-            scores = self.claude.ask(SYSTEM_PROMPT, _rescore_prompt(self.title, cands),
+            scores = self.claude.ask(SYSTEM_PROMPT, _rescore_prompt(self.title, cands, self.focus),
                                      lambda r: parse_rescores(r, ids), what="re-scoring")
             self.state["rescored"] = {key: scores}  # only the latest set is ever needed again
             self._save()
@@ -618,11 +633,12 @@ class Selector:
 
 def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, min_len: float,
                  max_len: float, model: str, claude_factory: Callable[[], Claude],
-                 force: bool = False) -> list[dict]:
+                 force: bool = False, focus: str | None = None,
+                 time_range: tuple[float | None, float | None] = (None, None)) -> list[dict]:
     if min_len <= 0 or max_len < min_len:
         raise ClipperError("--min-len must be positive and no larger than --max-len")
     sel = Selector(work, meta, transcript, min_len=min_len, max_len=max_len, model=model,
-                   claude_factory=claude_factory, force=force)
+                   claude_factory=claude_factory, force=force, focus=focus, time_range=time_range)
     clips = sel.run(num_clips)
     write_json(work / "clips.json", clips)
     for c in clips:

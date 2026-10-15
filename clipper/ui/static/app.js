@@ -177,6 +177,16 @@ function settingsFields(opts, keys) {
     h("input", { type: "number", min: 1, step, value: opts[key], onchange: e => saveOption(key, Number(e.target.value)) }));
   const chk = (key, label) => h("label", { class: "check" },
     h("input", { type: "checkbox", checked: !!opts[key], onchange: e => saveOption(key, e.target.checked) }), label);
+  const txt = (key, label, placeholder) => h("label", { class: "field" }, h("span", {}, label),
+    h("input", { type: "text", placeholder, value: opts[key] ?? "", onchange: e => saveOption(key, e.target.value.trim() || null) }));
+  const formats = () => h("div", { class: "field" }, h("span", {}, "Formats"),
+    h("div", { class: "row", style: "gap:12px" }, C.formats.map(f => h("label", { class: "check" },
+      h("input", { type: "checkbox", checked: (opts.formats || ["9:16"]).includes(f), onchange: e => {
+        const now = new Set(options().formats || ["9:16"]);
+        e.target.checked ? now.add(f) : now.delete(f);
+        if (!now.size) { e.target.checked = true; return toast("Keep at least one format"); }
+        saveOption("formats", C.formats.filter(x => now.has(x)));
+      } }), f))));
   const fields = {
     num_clips: () => num("num_clips", "Clips"),
     min_len: () => num("min_len", "Min length (s)"),
@@ -192,8 +202,15 @@ function settingsFields(opts, keys) {
     jump_cuts: () => sel("jump_cuts", "Jump cuts", C.jump_cuts, ["off", "pauses only", "pauses + filler words"]),
     encoder: () => sel("encoder", "Encoder", C.encoders, ["x264 (best quality)", "VideoToolbox (fast, Mac)", "auto"]),
     download: () => sel("download", "Download from links", ["sections", "full"], ["only the clips' video (fast)", "the whole video"]),
-    language: () => h("label", { class: "field" }, h("span", {}, "Language"),
-      h("input", { type: "text", placeholder: "detect", value: opts.language || "", onchange: e => saveOption("language", e.target.value.trim() || null) })),
+    language: () => txt("language", "Spoken language", "detect"),
+    caption_language: () => txt("caption_language", "Translate captions to", "e.g. English"),
+    range_start: () => txt("range_start", "Only from", "0:00"),
+    range_end: () => txt("range_end", "Until", "the end"),
+    logo: () => txt("logo", "Logo file", "/path/to/logo.png"),
+    logo_position: () => sel("logo_position", "Logo position", ["top-right", "top-left", "bottom-right", "bottom-left"]),
+    formats,
+    zoom: () => chk("zoom", "Auto-zoom on key moments"),
+    progress_bar: () => chk("progress_bar", "Progress bar"),
     uppercase: () => chk("uppercase", "Capital letters"),
     title_overlay: () => chk("title_overlay", "Title at the start"),
     posts: () => chk("posts", "Write post text"),
@@ -205,7 +222,8 @@ async function startJob(source) {
   const review = $("#review-first")?.checked ?? true;
   store.set("clipper.reviewFirst", review);
   try {
-    const job = await api.post("/api/jobs", { kind: "process", source, review, options: options() });
+    const focus = $("#focus")?.value.trim() || null;
+    const job = await api.post("/api/jobs", { kind: "process", source, review, options: { ...options(), prompt: focus } });
     S.followJob = job.id;
     S.openLogs.add(job.id);
     toast("Started");
@@ -254,6 +272,8 @@ async function renderHome() {
     h("section", { class: "panel hero" },
       h("div", {}, h("h1", {}, "Make clips"), h("div", { class: "muted" }, "From a long video to short vertical clips with captions. Claude picks the best moments.")),
       h("div", { class: "source-row" }, input, h("button", { class: "btn primary big", onclick: go }, "Start")),
+      h("input", { type: "text", id: "focus", autocomplete: "off",
+        placeholder: "Optional: what should Claude look for? e.g. funny moments, everything about pricing" }),
       drop,
       h("div", { class: "quick" },
         ...settingsFields(opts, ["num_clips", "min_len", "max_len"]),
@@ -261,9 +281,12 @@ async function renderHome() {
           h("input", { type: "checkbox", id: "review-first", checked: store.get("clipper.reviewFirst", true) }),
           "Let me review the clips before rendering")),
       h("details", {}, h("summary", {}, "More settings"),
-        h("div", { class: "settings" }, ...settingsFields(opts, ["model", "whisper_model", "caption_model", "language",
-          "caption_style", "caption_position", "layout", "jump_cuts", "encoder", "download"])),
-        h("div", { class: "row", style: "margin-top:14px; gap:22px" }, ...settingsFields(opts, ["uppercase", "title_overlay", "posts"]))),
+        h("div", { class: "settings" }, ...settingsFields(opts, ["range_start", "range_end", "model", "whisper_model",
+          "caption_model", "language", "caption_language", "caption_style", "caption_position", "layout", "jump_cuts",
+          "encoder", "download", "logo", "logo_position"])),
+        h("div", { style: "margin-top:14px" }, ...settingsFields(opts, ["formats"])),
+        h("div", { class: "row", style: "margin-top:14px; gap:22px" }, ...settingsFields(opts, ["uppercase", "title_overlay",
+          "zoom", "progress_bar", "posts"]))),
     ),
     h("section", { id: "jobs-section", hidden: true }, h("h2", {}, "Jobs"), h("div", { class: "jobs", id: "jobs" })),
     h("section", {}, h("h2", {}, "Library"), h("div", { id: "library" }, h("div", { class: "muted" }, "Loading…"))),
@@ -564,36 +587,87 @@ async function renderClips(chosen) {
 
 // -- rendered clips
 
+const RATIO_CSS = { "9:16": "9 / 16", "4:5": "4 / 5", "1:1": "1 / 1", "16:9": "16 / 9" };
+
 function clipsView() {
   const v = S.video;
   const clips = (v.rendered || []).filter(c => c.file);
   if (!clips.length) return h("div", { class: "panel empty" }, "No clips rendered yet. Pick clips in Review and press Render.");
-  return h("div", { class: "clips" }, clips.map(c => {
-    const src = `/media/${v.id}/output/${encodeURIComponent(c.file)}?v=${v.version}`;
-    const cover = c.cover ? `/media/${v.id}/output/${encodeURIComponent(c.cover)}?v=${v.version}` : null;
-    const text = h("div", { class: "post-text" });
-    const platforms = c.post ? [["TikTok", c.post.tiktok], ["Instagram", c.post.instagram],
-      ["YouTube", `${c.post.youtube_title}\n\n${c.post.youtube_description}`]] : [];
-    const tabs = h("div", { class: "post-tabs" });
-    const show = i => {
-      text.textContent = platforms[i][1];
-      [...tabs.children].forEach((b, j) => b.classList.toggle("active", i === j));
-    };
-    platforms.forEach(([name], i) => tabs.append(h("button", { onclick: () => show(i) }, name)));
-    if (platforms.length) setTimeout(() => show(0), 0);
-    return h("div", { class: "panel clip-card" },
-      h("video", { class: "vertical", src, poster: cover, controls: true, preload: "metadata", playsinline: true }),
-      h("div", { style: "margin-top:12px; font-weight:650" }, `${c.rank}. ${c.title}`),
-      h("div", { class: "meta" }, h("span", {}, `${Math.round(c.final_duration || c.duration)}s`),
-        c.score != null ? h("span", { class: "score" }, c.score) : null, h("span", {}, `from ${fmt(c.start)}`)),
-      h("div", { class: "row", style: "gap:8px" },
-        h("a", { class: "btn primary", href: src, download: c.file }, "Download"),
-        cover ? h("a", { class: "btn", href: cover, download: c.cover }, "Cover") : null),
-      platforms.length ? h("div", { class: "post" }, tabs, text,
-        h("button", { class: "btn ghost small", style: "margin-top:6px", onclick: async () => {
-          try { await navigator.clipboard.writeText(text.textContent); toast("Copied"); } catch { toast("Couldn't copy"); }
-        } }, "Copy text")) : null);
-  }));
+  return h("div", { class: "clips" }, clips.map(c => clipCard(v, c)));
+}
+
+function clipCard(v, c) {
+  const media = name => `/media/${v.id}/output/${encodeURIComponent(name)}?v=${v.version}`;
+  const formats = c.formats ? Object.entries(c.formats) : [["9:16", { file: c.file, cover: c.cover }]];
+  const player = h("video", { class: "vertical", controls: true, preload: "metadata", playsinline: true });
+  const download = h("a", { class: "btn primary" }, "Download");
+  const coverLink = h("a", { class: "btn" }, "Cover");
+  const pills = h("div", { class: "post-tabs" });
+  const pick = i => {
+    const [ratio, f] = formats[i];
+    player.src = media(f.file);
+    player.poster = f.cover ? media(f.cover) : "";
+    player.style.aspectRatio = RATIO_CSS[ratio] || "9 / 16";
+    download.href = media(f.file); download.download = f.file;
+    coverLink.href = f.cover ? media(f.cover) : "#"; coverLink.download = f.cover || "";
+    [...pills.children].forEach((b, j) => b.classList.toggle("active", i === j));
+  };
+  formats.forEach(([ratio], i) => pills.append(h("button", { onclick: () => pick(i) }, ratio)));
+  setTimeout(() => pick(0), 0);
+
+  const text = h("div", { class: "post-text" });
+  const platforms = c.post ? [["TikTok", c.post.tiktok], ["Instagram", c.post.instagram],
+    ["YouTube", `${c.post.youtube_title}\n\n${c.post.youtube_description}`]] : [];
+  const tabs = h("div", { class: "post-tabs" });
+  const show = i => {
+    text.textContent = platforms[i][1];
+    [...tabs.children].forEach((b, j) => b.classList.toggle("active", i === j));
+  };
+  platforms.forEach(([name], i) => tabs.append(h("button", { onclick: () => show(i) }, name)));
+  if (platforms.length) setTimeout(() => show(0), 0);
+
+  const editor = h("div", { class: "caption-editor", hidden: true });
+  const card = h("div", { class: "panel clip-card" },
+    player,
+    formats.length > 1 ? h("div", { style: "margin-top:8px" }, pills) : null,
+    h("div", { style: "margin-top:12px; font-weight:650" }, `${c.rank}. ${c.title}`),
+    h("div", { class: "meta" }, h("span", {}, `${Math.round(c.final_duration || c.duration)}s`),
+      c.score != null ? h("span", { class: "score" }, c.score) : null, h("span", {}, `from ${fmt(c.start)}`)),
+    h("div", { class: "row", style: "gap:8px" }, download, coverLink,
+      ...(c.srt || []).map(f => h("a", { class: "btn ghost", href: media(f), download: f, title: "Caption file" },
+        f.split(".").length > 2 ? `Captions (${f.split(".").slice(-2, -1)[0]})` : "Captions")),
+      h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor) }, "Fix captions")),
+    editor,
+    platforms.length ? h("div", { class: "post" }, tabs, text,
+      h("button", { class: "btn ghost small", style: "margin-top:6px", onclick: async () => {
+        try { await navigator.clipboard.writeText(text.textContent); toast("Copied"); } catch { toast("Couldn't copy"); }
+      } }, "Copy text")) : null);
+  return card;
+}
+
+async function openCaptionEditor(v, c, box) {
+  if (!box.hidden) { box.hidden = true; return; }
+  box.hidden = false;
+  box.replaceChildren(h("div", { class: "small muted" }, "Loading…"));
+  let data;
+  try { data = await api.get(`/api/videos/${v.id}/captions/${c.rank}`); }
+  catch (e) { box.replaceChildren(h("div", { class: "error" }, e.message)); return; }
+  const inputs = data.lines.map(l => h("textarea", { rows: 2, "aria-label": `Caption at ${fmt(l.start)}` }, l.text));
+  const send = async body => {
+    try {
+      await api.post(`/api/videos/${v.id}/captions/${c.rank}`, { ...body, options: options() });
+      box.hidden = true;
+      toast("Saved. Updating the clips…");
+      pollJobs();
+    } catch (e) { toast(e.message); }
+  };
+  box.replaceChildren(
+    h("div", { class: "small muted" }, "Correct any misheard words, then save. The clips are rendered again with your text."),
+    ...data.lines.map((l, i) => h("label", { class: "caption-line" }, h("span", { class: "t" }, fmt(l.start)), inputs[i])),
+    h("div", { class: "row", style: "gap:8px; margin-top:8px" },
+      h("button", { class: "btn primary", onclick: () => send({ lines: data.lines.map((l, i) => ({ ...l, text: inputs[i].value })) }) }, "Save and update"),
+      data.edited ? h("button", { class: "btn ghost", onclick: () => send({ reset: true }) }, "Undo my corrections") : null,
+      h("button", { class: "btn ghost", onclick: () => { box.hidden = true; } }, "Cancel")));
 }
 
 // ---------------------------------------------------------------------------------------------

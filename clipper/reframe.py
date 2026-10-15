@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from .formats import VERTICAL, Format
 from .util import ClipperError, Progress, cached, fingerprint, log, read_frames
 
 if TYPE_CHECKING:
@@ -49,9 +50,10 @@ YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/face_detectio
              "face_detection_yunet_2023mar.onnx")
 
 
-def crop_width(width: int, height: int) -> int:
-    """Width of a full-height 9:16 window, or the full width if the video is already that narrow."""
-    cw = int(round(height * 9 / 16 / 2)) * 2
+def crop_width(width: int, height: int, ratio: float = 9 / 16) -> int:
+    """Width of a full-height window of the output's shape (9:16 by default), or the full width if
+    the video is already that narrow."""
+    cw = int(round(height * ratio / 2)) * 2
     return min(cw, width)
 
 
@@ -308,7 +310,7 @@ def _even(x: float) -> int:
 
 
 def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: int, H: int, cw: int,
-              fps: float, layout: str, speaking: list[bool]) -> tuple[str, list | None, dict]:
+              fps: float, layout: str, speaking: list[bool], fmt: Format = VERTICAL) -> tuple[str, list | None, dict]:
     """Framing for frames a..b-1 of one shot: ("fit", None), or a mode with one value per frame."""
     n = len(samples)
     found = people(build_tracks(samples), n) if n else []
@@ -348,11 +350,11 @@ def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: 
 
     paths = [camera_path(frames, centers(t), a, b - 1, W, cw, fps) for t in (left, right)]
     follow = per_frame([lambda i, sp=int(sp): paths[sp][i] for sp in turns])
-    if layout == "follow":
+    if layout == "follow" or fmt.ratio >= 1:  # stacking two people only works in tall formats
         return "follow", follow, info
 
     hc = min(H, max(_even(0.4 * H), _even(3.5 * max(_median(left, 3), _median(right, 3)))))
-    wc = min(W, _even(hc * 9 / 8))
+    wc = min(W, _even(hc * fmt.width / (fmt.height / 2)))
     xs = [camera_path(frames, centers(t), a, b - 1, W, wc, fps) for t in (left, right)]
     ys = [int(min(max(_median(t, 1) - 0.42 * hc, 0), H - hc)) for t in (left, right)]
     split = [[xl, ys[0], xr, ys[1], hc] for xl, xr in zip(*xs)]
@@ -366,12 +368,12 @@ def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: 
 
 
 def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict] | None = None,
-            layout: str = "auto") -> dict:
+            layout: str = "auto", fmt: Format = VERTICAL) -> dict:
     import cv2
 
     W, H = meta["width"], meta["height"]
     fps = float(Fraction(meta["fps"]))
-    cw = crop_width(W, H)
+    cw = crop_width(W, H, fmt.ratio)
     aw = min(ANALYSIS_WIDTH, W) // 2 * 2
     ah = int(round(H * aw / W / 2)) * 2
     scale = W / aw
@@ -415,7 +417,7 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
             xs[a:b] = [xs[a - 1]] * (b - a)
             shots.append({"start": a, "end": b, "mode": shots[-1]["mode"], "inherited": True})
             continue
-        mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, layout, speaking)
+        mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, layout, speaking, fmt)
         if values is not None:
             xs[a:b] = values
         shots.append({"start": a, "end": b, "mode": mode, **info})
@@ -427,18 +429,19 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
     return {"width": W, "height": H, "crop_w": cw, "frames": n, "shots": shots, "x": xs}
 
 
-def reframe(work: Path, meta: dict, clip: dict, clip_dir: Path, words: list[dict] | None = None,
-            layout: str = "auto", force: bool = False, src: "ClipVideo | None" = None) -> dict:
+def reframe(work: Path, meta: dict, clip: dict, out_dir: Path, words: list[dict] | None = None,
+            layout: str = "auto", force: bool = False, src: "ClipVideo | None" = None,
+            fmt: Format = VERTICAL) -> dict:
     from .ingest import ClipVideo
 
     src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
     speech = [[round(w["s"], 2), round(w["e"], 2)] for w in words or []]
     params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"], "layout": layout,
-              "speech": fingerprint(speech), "video": src.key()}
+              "speech": fingerprint(speech), "video": src.key(), "format": fmt.name}
     # The file may be a section of the video: work in its own time, which starts at src.offset.
     local = [{**w, "s": w["s"] - src.offset, "e": w["e"] - src.offset} for w in words or []]
     dims = {"width": src.width, "height": src.height, "fps": src.fps}
-    return cached(clip_dir / "reframe.json", params,
+    return cached(out_dir / "reframe.json", params,
                   lambda: analyze(src.path, dims, clip["start"] - src.offset, clip["end"] - src.offset,
-                                  local, layout),
-                  force=force, label=f"reframe #{clip['rank']}")
+                                  local, layout, fmt),
+                  force=force, label=f"reframe #{clip['rank']} ({fmt.name})")

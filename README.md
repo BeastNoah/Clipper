@@ -9,10 +9,12 @@ clipper ui                                          # the web interface
 clipper "https://www.youtube.com/watch?v=..." -n 5  # or straight from the command line
 clipper ~/Movies/interview.mp4 --min-len 30 --max-len 75
 clipper "https://www.youtube.com/playlist?list=..."  # every video in a playlist
+clipper talk.mp4 --prompt "funny moments" --from 10:00 --to 45:00 --format 9:16,1:1
 ```
 
 Finished clips land in `work/<video_id>/output/`: `01_<title>.mp4`, `02_<title>.mp4`, … (best
-first), each with a cover image (`.jpg`) and post text with hashtags (`.txt`).
+first), each with a cover image (`.jpg`), a caption file (`.srt`) and post text with hashtags
+(`.txt`). Extra formats get a suffix, e.g. `01_<title>_1x1.mp4`.
 
 ## Install (macOS)
 
@@ -37,8 +39,10 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
 
 `clipper ui` opens a page in your browser. By default only this computer can use it.
 
-- **Make clips:** paste a link or a file path, or drop a video file. Pick how many clips and how
-  long; more settings are under "More settings".
+- **Make clips:** paste a link or a file path, or drop a video file, and optionally say what Claude
+  should look for ("funny moments", "everything about pricing"). Pick how many clips and how long;
+  "More settings" has the rest: a time range, formats, translation, logo, zoom, progress bar,
+  caption style and more.
 - **Review:** with "Let me review the clips before rendering" ticked, clipper stops after Claude
   has made its suggestions. Each suggestion shows Claude's score and sub-scores, the hook, the
   highlight keywords and whether Claude thinks it repeats a better clip. You can preview it in
@@ -47,8 +51,9 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   Click two sentences in the transcript to add a clip of your own.
 - **Render:** renders the ticked clips. Jobs run one at a time and show progress, a time
   estimate and the log; they can be cancelled.
-- **Clips:** watch and download the finished clips and covers, and copy the post text for
-  TikTok, Instagram or YouTube.
+- **Clips:** watch and download the finished clips (switch between formats), covers and caption
+  files, and copy the post text for TikTok, Instagram or YouTube. **Fix captions** lets you correct
+  misheard words; the clip is then rendered again with your text.
 
 ### On your phone
 
@@ -75,14 +80,21 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `-n`, `--num-clips` | 3 | clips per video |
 | `--min-len` / `--max-len` | 20 / 60 | clip length limits in seconds |
 | `--model` | `opus` | Claude model that picks the clips (`opus`, `sonnet`, `haiku` or a full name) |
+| `--prompt TEXT` | | what Claude should look for, e.g. `"funny moments"` or `"everything about pricing"` |
+| `--from` / `--to` | | only use part of the video, e.g. `--from 10:00 --to 45:00` |
 | `--whisper-model` | `small` | model for the full transcript |
 | `--caption-model` | `turbo` | bigger model that re-transcribes only the chosen clips, for accurate captions; `none` reuses the transcript |
 | `--whisper-backend` | `auto` | `mlx` (Apple Silicon GPU) when installed, else `faster-whisper` (CPU) |
 | `--language` | detect | spoken language, e.g. `en`, `de` |
+| `--caption-language` | | translate the captions (and title), e.g. `English`; also writes a translated `.srt` |
 | `--caption-style` | `bold` | `bold` (heavy white text, yellow pop), `clean` (lighter, no pop), `boxed` (text on a dark box) |
 | `--font`, `--caption-size`, `--highlight-color`, `--uppercase` | | fine-tune the captions |
 | `--caption-position` | `lower` | `lower` third or `middle` |
 | `--no-title` | | don't show the clip title for the first seconds |
+| `--format` | `9:16` | output shapes, comma separated: `9:16`, `4:5`, `1:1`, `16:9` |
+| `--no-zoom` | | no automatic zoom-ins on the hook and Claude's keywords |
+| `--progress-bar` | | a progress bar along the top |
+| `--logo FILE`, `--logo-position` | top-right | your logo on every clip (a PNG with transparency works best) |
 | `--jump-cuts` | `on` | `on` cuts long pauses and filler words ("um", "äh"), `pauses` only pauses, `off` nothing |
 | `--layout` | `auto` | two people in a shot: `follow` whoever talks, `split` screen, `auto` (split during back-and-forth, follow otherwise), `main` person only |
 | `--encoder` | `x264` | `videotoolbox` uses the Mac's hardware encoder: much faster, slightly bigger files |
@@ -116,7 +128,8 @@ for every word: mlx-whisper on an Apple Silicon GPU, or faster-whisper on the CP
 model runs at about 7–10x real time there, so a 20-minute video takes 2–3 minutes).
 
 **3. Select the clips** (`select.py`, `audio.py`). This is where Claude comes in.
-- The transcript is split into sentences and sent to Claude with timestamps, one per line. Lines
+- The transcript is split into sentences and sent to Claude with timestamps, one per line (only
+  the part between `--from` and `--to`, if given, and with your `--prompt` saying what to look for). Lines
   carry cues from the audio: `[loud]`, `[+1.8s non-speech sound]` (often laughter or applause)
   and `[pause 2.1s]`, so Claude also notices reactions, not just words.
 - Acting as a short-form video editor, Claude proposes clips, each with a title, the opening hook
@@ -147,12 +160,18 @@ long pauses and filler words, but only where the audio is really quiet, so laugh
 Whisper missed are never cut. Words are grouped into lines of 2–4 that never run across a sentence
 and fit the frame; the word being spoken lights up with a small pop and Claude's keywords stay in
 a second colour. The clip's title is shown at the top for the first seconds. Captions sit in the
-lower third, above where TikTok and Instagram put their own text and buttons.
+lower third, above where TikTok and Instagram put their own text and buttons. With
+`--caption-language`, Claude translates each sentence and its time is spread over the translated
+words. Corrections made in the web interface replace the transcribed words. A `.srt` caption file
+is written for each clip as well.
 
 **6. Render** (`render.py`, `posts.py`). ffmpeg decodes the clip frame by frame; Python builds each
-vertical frame (window, split screen or blurred background), skips the frames removed by jump
-cuts, and hands the rest to a second ffmpeg, which burns in the captions, adds the matching audio
-and writes a 1080×1920 MP4. A cover image and post text for each platform are written alongside.
+frame (window, split screen or blurred background), zooms in a little on the hook and on Claude's
+keywords, draws the logo and progress bar, skips the frames removed by jump cuts, and hands the
+rest to a second ffmpeg, which burns in the captions, adds the matching audio and writes the MP4:
+1080×1920 for 9:16, 1080×1350 for 4:5, 1080×1080 for 1:1, 1920×1080 for 16:9. Each format gets its
+own framing (split screen only in the tall ones). A cover image and post text for each platform
+are written alongside.
 
 ## The work folder
 
@@ -169,8 +188,9 @@ work/<video_id>/
   review.json          your picks from the web interface
   posts.json           post text per clip
   clips/<start>-<end>/ per clip: section.mp4 (just this part of the video, for links), words.json,
+                       words_edited.json (your caption fixes), and per format (9x16/, 1x1/, …):
                        reframe.json, captions.ass, clip.mp4, cover.jpg
-  output/              the finished clips, covers, post text and clips.json
+  output/              the finished clips, covers, caption files, post text and clips.json
 ```
 
 Per-clip results are stored by time range, so a clip that's still selected after you change

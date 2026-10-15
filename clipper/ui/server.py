@@ -33,7 +33,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from ..captions import PRESETS
 from ..edit import MODES as JUMP_CUT_MODES
-from ..pipeline import Options, load_video, process, produce_reviewed
+from ..formats import SIZES
+from ..pipeline import (
+    Options, caption_lines, edited_words, load_video, process, produce_reviewed, rerender, save_caption_lines,
+)
 from ..reframe import LAYOUTS
 from ..render import ENCODERS
 from ..select import split_sentences
@@ -139,7 +142,7 @@ def choices() -> dict:
     return {
         "defaults": Options().to_dict(),
         "caption_styles": list(PRESETS), "layouts": list(LAYOUTS), "jump_cuts": list(JUMP_CUT_MODES),
-        "encoders": list(ENCODERS), "models": ["opus", "sonnet", "haiku"],
+        "encoders": list(ENCODERS), "models": ["opus", "sonnet", "haiku"], "formats": list(SIZES),
         "whisper_models": ["tiny", "base", "small", "medium", "large-v3", "turbo"],
     }
 
@@ -364,6 +367,13 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(404, "no such video")
             if len(route) == 2:
                 return self._json(video_detail(work))
+            if len(route) == 4 and route[2] == "captions":
+                clip = self.app.rendered_clip(work, route[3])
+                if clip is None:
+                    return self._error(404, "no such clip")
+                return self._json({"rank": clip["rank"], "title": clip["title"],
+                                   "lines": caption_lines(work, clip),
+                                   "edited": edited_words(work, clip) is not None})
             if route[2:] == ["frame"]:
                 t = float((qs.get("t") or ["0"])[0])
                 return self._file(frame_jpeg(work, max(0.0, t)), cache=True)
@@ -381,6 +391,21 @@ class Handler(BaseHTTPRequestHandler):
         if parts == ["api", "jobs"]:
             try:
                 job = self.app.make_job(self._body())
+            except (ClipperError, ValueError, KeyError, TypeError) as e:
+                return self._error(400, str(e))
+            return self._json(job.public(), 201)
+        if len(parts) == 5 and parts[:2] == ["api", "videos"] and parts[3] == "captions":
+            work = self._work(parts[2])
+            clip = self.app.rendered_clip(work, parts[4]) if work else None
+            if clip is None:
+                return self._error(404, "no such clip")
+            body = self._body()
+            try:
+                if body.get("reset"):
+                    (work / "clips").joinpath(edits_name(clip)).unlink(missing_ok=True)
+                else:
+                    save_caption_lines(work, clip, body.get("lines") or [])
+                job = self.app.make_job({"kind": "rerender", "video": work.name, "options": body.get("options", {})})
             except (ClipperError, ValueError, KeyError, TypeError) as e:
                 return self._error(400, str(e))
             return self._json(job.public(), 201)
@@ -455,7 +480,30 @@ class App:
                 produce_reviewed(work, items, opts)
             title = read_json(work / "meta.json").get("title") or vid
             return self.jobs.submit(Job("render", f"Render {len(items)} clip(s): {title}", run, video=vid))
-        raise ValueError("kind must be 'process' or 'render'")
+        if kind == "rerender":
+            vid = str(body.get("video") or "")
+            work = self.root / vid
+            if not VIDEO_ID.match(vid) or not (work / "output" / "clips.json").exists():
+                raise ValueError("this video has no rendered clips")
+            opts.stop_after = None
+
+            def run(job: Job) -> None:
+                job.video = vid
+                rerender(work, opts)
+            title = read_json(work / "meta.json").get("title") or vid
+            return self.jobs.submit(Job("render", f"Update clips: {title}", run, video=vid))
+        raise ValueError("kind must be 'process', 'render' or 'rerender'")
+
+    def rendered_clip(self, work: Path, rank: str) -> dict | None:
+        path = work / "output" / "clips.json"
+        if not path.exists() or not str(rank).isdigit():
+            return None
+        return next((c for c in read_json(path) if c.get("rank") == int(rank)), None)
+
+
+def edits_name(clip: dict) -> str:
+    """Path of a clip's caption corrections, relative to the work folder's clips/ directory."""
+    return f"{round(clip['start'] * 1000):08d}-{round(clip['end'] * 1000):08d}/words_edited.json"
 
 
 def lan_ip() -> str | None:
