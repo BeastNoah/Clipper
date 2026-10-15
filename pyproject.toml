@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipper"
+version = "0.1.0"
+description = "Turn one long video into a few short vertical clips, picked by Claude."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "faster-whisper>=1.0",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.8,<5",  # 5.x drops the Haar fallback detector
+    "pydantic>=2.0",
+    "yt-dlp[default]>=2025.11.12",  # [default] includes the YouTube JS challenge solver
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+clipper = "clipper.cli:main"
+
+[tool.setuptools]
+packages = ["clipper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
