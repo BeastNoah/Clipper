@@ -20,7 +20,7 @@ from .reframe import LAYOUTS, reframe
 from .render import ENCODERS, check_ffmpeg_has_libass, render
 from .select import clips_from_review, select_clips
 from .transcribe import clip_words, transcribe
-from .util import ClipperError, log, read_json, report, require_tool, slugify, write_json
+from .util import ClipperError, check_cancel, log, read_json, report, require_tool, slugify, write_json
 
 STEPS = ["ingest", "transcribe", "select", "reframe", "captions", "render"]
 
@@ -67,6 +67,11 @@ class Options:
         ]:
             if value not in allowed:
                 problems.append(f"{name} must be one of {', '.join(str(a) for a in allowed if a)}")
+        if not problems:
+            try:
+                self.style  # noqa: B018 - builds the caption style, which checks font size and colour
+            except ValueError as e:
+                problems.append(str(e))
         if problems:
             raise ClipperError("; ".join(problems))
         return self
@@ -116,12 +121,13 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
     loud = Loudness.from_work(work) if opts.jump_cuts != "off" else None
     out_dir = work / "output"
     out_dir.mkdir(exist_ok=True)
-    if do_render:
+    if do_render:  # the list goes first, so an interrupted render never points at deleted files
         for old in out_dir.iterdir():
-            if old.suffix in (".mp4", ".jpg", ".txt"):
+            if old.suffix in (".mp4", ".jpg", ".txt") or old.name == "clips.json":
                 old.unlink()
 
     for clip in clips:
+        check_cancel()
         report("step", f"clip {clip['rank']} of {len(clips)}")
         cdir = clip_dir_for(work, clip)
         cdir.mkdir(parents=True, exist_ok=True)
@@ -135,7 +141,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         if not do_render:
             continue
         mp4 = render(work, meta, clip, plan, edit, ass, cdir, encoder=opts.encoder, crf=opts.crf,
-                     preset=opts.preset, force=opts.forced("captions"))
+                     preset=opts.preset, force=opts.forced("render"))
         name = f"{clip['rank']:02d}_{slugify(clip['title'])}"
         _publish(mp4, out_dir / f"{name}.mp4")
         _publish(cdir / "cover.jpg", out_dir / f"{name}.jpg")
@@ -166,17 +172,20 @@ def process(source: str, opts: Options) -> tuple[Path, list[dict]]:
     report("video", work.name)
     if opts.stop_after == "ingest":
         return work, []
+    check_cancel()
     report("step", "transcribe")
     transcript = transcribe(work, meta, opts.whisper_model, opts.language, opts.whisper_backend,
                             force=opts.forced("transcribe"))
     if opts.stop_after == "transcribe":
         return work, []
+    check_cancel()
     report("step", "select")
     clips = select_clips(work, meta, transcript, num_clips=opts.num_clips, min_len=opts.min_len,
                          max_len=opts.max_len, model=opts.model, claude_factory=claude_factory(opts, work),
                          force=opts.forced("select"))
     if not clips:
         raise ClipperError("Claude didn't find any usable clips in this video.")
+    check_cancel()
     if opts.stop_after == "select":
         return work, clips
     return work, produce(work, meta, transcript, clips, opts)

@@ -82,3 +82,11 @@ def test_keywords_title_and_styles():
     style_line = next(l for l in ass.splitlines() if l.startswith("Style: Default"))
     assert style_line.split(",")[15] == "3" and style_line.split(",")[18] == "5"  # boxed, middle
     assert "Cover" in build_cover_ass("A {weird} title")
+
+
+def test_very_short_words_are_kept_when_nothing_was_cut():
+    words = [{"w": " So,", "s": 0.0, "e": 0.3}, {"w": " I", "s": 112.34, "e": 112.36},
+             {"w": " went", "s": 112.36, "e": 112.37}, {"w": " home.", "s": 112.4, "e": 112.8}]
+    mapped = map_words(words, 0.0, EditMap([(0.0, 113.0)]))
+    assert [x["w"] for x in mapped] == ["So,", "I", "went", "home."]
+    assert all(x["e"] - x["s"] >= 0.05 - 1e-9 for x in mapped)

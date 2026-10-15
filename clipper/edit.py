@@ -58,6 +58,20 @@ def plan_cuts(words: list[dict], start: float, end: float, fps: float, mode: str
         c0, c1 = grid(a_end + KEEP_AFTER), grid(b_start - KEEP_BEFORE)
         if c1 - c0 >= MIN_CUT and silent_outside_fillers(c0, c1):
             removed.append((c0, c1))
+    # Each filler word goes too, however short the pauses around it (never into a spoken word).
+    for fs, fe in fillers:
+        before = max((e for s, e in spoken if e <= fs + 0.01), default=0.0)
+        after = min((s for s, e in spoken if s >= fe - 0.01), default=duration)
+        c0, c1 = grid(max(fs - 0.04, before + 0.05)), grid(min(fe + 0.06, after - 0.03))
+        if c1 > c0:
+            removed.append((c0, c1))
+    merged: list[tuple[float, float]] = []
+    for c0, c1 in sorted(removed):
+        if merged and c0 <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], c1))
+        else:
+            merged.append((c0, c1))
+    removed = merged
 
     keep, t = [], 0.0
     for c0, c1 in removed:
@@ -79,6 +93,10 @@ class EditMap:
             self.offsets.append(total)
             total += b - a
         self.duration = total
+
+    def is_cut(self, t: float) -> bool:
+        """Was the moment t (seconds from the clip start) removed?"""
+        return not any(a <= t < b for a, b in self.segments)
 
     def to_output(self, t: float) -> float:
         for (a, b), off in zip(self.segments, self.offsets):

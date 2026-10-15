@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -102,13 +103,35 @@ def require_tool(name: str) -> str:
     return path
 
 
+def run_proc(cmd: list[str], *, input: bytes | None = None, cwd: Path | None = None,
+             env: dict | None = None, timeout: float | None = None) -> tuple[int, bytes, bytes]:
+    """Run a command to completion (returncode, stdout, stderr), killing it if the UI cancels."""
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL)
+    deadline = None if timeout is None else time.monotonic() + timeout
+    while True:
+        try:
+            out, err = proc.communicate(input, timeout=0.5)
+            return proc.returncode, out, err
+        except subprocess.TimeoutExpired:
+            expired = deadline is not None and time.monotonic() > deadline
+            try:
+                if expired:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                check_cancel()
+            except BaseException:
+                proc.kill()
+                proc.communicate()
+                raise
+
+
 def run(cmd: list[str], *, cwd: Path | None = None, input: bytes | None = None) -> subprocess.CompletedProcess:
     """Run a command, raising ClipperError with the tail of stderr on failure."""
-    proc = subprocess.run(cmd, cwd=cwd, input=input, capture_output=True)
-    if proc.returncode != 0:
-        tail = proc.stderr.decode(errors="replace").strip().splitlines()[-15:]
-        raise ClipperError(f"{Path(cmd[0]).name} failed (exit {proc.returncode}):\n" + "\n".join(tail))
-    return proc
+    code, out, err = run_proc(cmd, cwd=cwd, input=input)
+    if code != 0:
+        tail = err.decode(errors="replace").strip().splitlines()[-15:]
+        raise ClipperError(f"{Path(cmd[0]).name} failed (exit {code}):\n" + "\n".join(tail))
+    return subprocess.CompletedProcess(cmd, code, out, err)
 
 
 def ffprobe(path: Path) -> dict:
@@ -212,6 +235,12 @@ def fmt_time(seconds: float) -> str:
     m, s = divmod(max(seconds, 0.0), 60)
     h, m = divmod(int(m), 60)
     return f"{h}:{m:02d}:{s:04.1f}" if h else f"{m}:{s:04.1f}"
+
+
+def ascii_slug(text: str, max_len: int = 40) -> str:
+    """slugify, with accents removed and other non-ASCII letters dropped: safe in URLs and paths."""
+    plain = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return slugify(plain, max_len)
 
 
 def slugify(text: str, max_len: int = 40) -> str:

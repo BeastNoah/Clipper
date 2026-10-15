@@ -142,7 +142,7 @@ function jobView(job) {
     h("div", { class: "job-head" },
       h("span", { class: `badge ${job.state}` }, job.state),
       h("div", { class: "job-title grow", title: job.label }, job.label),
-      job.video ? h("a", { class: "btn ghost", href: `#/video/${job.video}` }, "Open") : null,
+      job.video && S.route?.id !== job.video ? h("a", { class: "btn ghost", href: `#/video/${job.video}` }, "Open") : null,
       h("button", { class: "btn ghost", onclick: async () => {
         if (open) S.openLogs.delete(job.id); else { S.openLogs.add(job.id); S.logs[job.id] = (await api.get(`/api/jobs/${job.id}`)).log; }
         renderJobs(); renderVideoJob();

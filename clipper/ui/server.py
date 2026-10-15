@@ -257,6 +257,30 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the browser stopped reading (normal when seeking a video)
 
+    def _trusted(self) -> bool:
+        """Only this page may use the API: the Host must be our own address (no DNS rebinding) and
+        a cross-site Origin is refused."""
+        port = self.server.server_address[1]
+        ok = {f"127.0.0.1:{port}", f"localhost:{port}"}
+        if self.headers.get("Host") not in ok:
+            return False
+        origin = self.headers.get("Origin")
+        return origin is None or origin.removeprefix("http://") in ok
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def parse_request(self) -> bool:
+        if not super().parse_request():
+            return False
+        if not self._trusted():
+            self._error(403, "requests must come from the clipper page itself")
+            return False
+        return True
+
     # -- routes
     def do_HEAD(self):
         self.do_GET()
@@ -303,6 +327,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parts = [p for p in urlparse(self.path).path.strip("/").split("/") if p]
+        if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+            return self._error(415, "send JSON")  # also keeps other web pages from posting forms here
         if parts == ["api", "jobs"]:
             try:
                 job = self.app.make_job(self._body())

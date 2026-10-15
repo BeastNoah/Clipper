@@ -229,3 +229,17 @@ def test_review_items_become_clips():
     assert clips[1]["title"] == "Mine" and clips[1]["id"] == "u10-12"
     with pytest.raises(ClipperError):
         clips_from_review({"words": words}, meta, [], [{"si": 5, "ei": 99}])
+
+
+def test_video_ids_are_ascii_and_bad_options_fail_early(tmp_path):
+    from clipper.ingest import local_video_id
+    from clipper.pipeline import Options
+
+    f = tmp_path / "Gespräch über Ärger – 第一.mp4"
+    f.write_bytes(b"x" * 5000)
+    vid = local_video_id(f)
+    assert re.fullmatch(r"[a-z0-9][a-z0-9-]+", vid) and vid.startswith("gesprach-uber-arger")
+    with pytest.raises(ClipperError, match="#FFE600"):
+        Options(highlight_color="red").validate()
+    with pytest.raises(ClipperError, match="layout"):
+        Options(layout="sideways").validate()

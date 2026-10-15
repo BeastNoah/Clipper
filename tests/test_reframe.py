@@ -129,3 +129,8 @@ def test_two_people_close_together_are_framed_together():
     mode, xs, info = plan_shot(samples, [k * 6 for k in range(n)], 0, 120, 1920, 1080, 608, 30, "auto", [True] * n)
     assert mode == "track" and info["framing"] == "together"
     assert xs[0] == 625 - 304
+
+
+def test_no_cut_in_the_last_few_frames():
+    changes = [0.0] + [1.0] * 58 + [60.0, 1.0, 1.0]  # a cut 2 frames before the end would be a flash
+    assert detect_cuts(changes, 30) == []

@@ -9,7 +9,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .util import (
-    ClipperError, audio_stream, ffprobe, log, parse_rate, read_json, run, slugify,
+    ClipperError, ascii_slug, audio_stream, check_cancel, ffprobe, log, parse_rate, read_json, run,
     video_stream, write_json,
 )
 
@@ -34,7 +34,7 @@ def local_video_id(path: Path) -> str:
         if size > 2 << 20:
             f.seek(-(1 << 20), os.SEEK_END)
             h.update(f.read())
-    return f"{slugify(path.stem, 32)}-{h.hexdigest()[:8]}"
+    return f"{ascii_slug(path.stem, 32)}-{h.hexdigest()[:8]}"
 
 
 def pick_frame_rate(stream: dict) -> Fraction:
@@ -59,7 +59,9 @@ def expand_sources(sources: list[str]) -> list[str]:
             out.append(src)
             continue
         yt_dlp = _yt_dlp()
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}) as ydl:
+        # noplaylist: a watch?v=…&list=… link means that one video, not the whole playlist or Mix
+        opts = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist", "noplaylist": True}
+        with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(src, download=False)
         if info.get("_type") == "playlist":
             urls = [e.get("url") or e.get("webpage_url") for e in info.get("entries") or []]
@@ -77,7 +79,7 @@ def url_video_id(url: str) -> tuple[str, dict]:
         info = ydl.extract_info(url, download=False)
     if info.get("_type") == "playlist":
         raise ClipperError("That URL is a playlist; pass a single video URL.")
-    vid = f"{slugify(info.get('extractor_key') or 'web', 12)}-{slugify(str(info['id']), 40)}"
+    vid = f"{ascii_slug(info.get('extractor_key') or 'web', 12)}-{ascii_slug(str(info['id']), 40)}"
     return vid, info
 
 
@@ -104,6 +106,7 @@ def download(url: str, dest_dir: Path) -> Path:
         "quiet": True,
         "no_warnings": True,
         "noprogress": True,
+        "progress_hooks": [lambda _: check_cancel()],
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)

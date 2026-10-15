@@ -43,3 +43,14 @@ def test_edit_map():
     assert m.to_output(1.0) == 1.0 and m.to_output(2.5) == 2.0 and m.to_output(4.0) == 3.0
     assert m.frame_ranges(10) == [(0, 20), (30, 50)]
     assert not m.is_identity and EditMap([(0.0, 3.0)]).is_identity
+
+
+def test_a_filler_right_after_a_word_is_cut_completely():
+    words = [w("So,", 10.0, 10.3), w("um,", 10.3, 10.8), w("I", 11.0, 11.1), w("think", 11.2, 11.5)]
+    keep = plan_cuts(words, 9.9, 11.7, 30, "on")
+    edit = EditMap(keep)
+    # "um" goes, apart from at most ~70 ms kept after "So," because Whisper's boundaries are fuzzy
+    assert all(edit.is_cut(t - 9.9) for t in (10.38, 10.55, 10.78))
+    assert not any(edit.is_cut(t - 9.9) for t in (10.1, 10.28, 11.05, 11.4))  # the real words stay
+    tight = [w("So", 10.0, 10.3), w("uh", 10.35, 10.5), w("I", 10.55, 10.7)]
+    assert EditMap(plan_cuts(tight, 9.9, 10.9, 30, "on")).is_cut(10.42 - 9.9)  # even with no pause around it

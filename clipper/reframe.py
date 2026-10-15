@@ -234,7 +234,7 @@ def detect_cuts(changes: list[float], fps: float) -> list[int]:
     cuts, last = [], 0
     for i in range(1, n):
         c = changes[i]
-        if c < CUT_MIN_CHANGE or i - last < min_len:
+        if c < CUT_MIN_CHANGE or i - last < min_len or n - i < min_len:
             continue
         around = [changes[j] for j in range(max(1, i - CUT_WINDOW), min(n, i + CUT_WINDOW + 1)) if j != i]
         avg = sum(around) / len(around) if around else 0.0
@@ -406,6 +406,11 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
         shot_samples = [[(bx[0] * scale, bx[1] * scale, bx[2] * scale, bx[3] * scale, bx[4]) for bx in samples[k]]
                         for k in idx]
         speaking = [any(t0 <= f / fps <= t1 for t0, t1 in talk) for f in frames]
+        if not idx and shots and a > 0:
+            # too short to have a face sample: keep framing it like the shot before
+            xs[a:b] = [xs[a - 1]] * (b - a)
+            shots.append({"start": a, "end": b, "mode": shots[-1]["mode"], "inherited": True})
+            continue
         mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, layout, speaking)
         if values is not None:
             xs[a:b] = values

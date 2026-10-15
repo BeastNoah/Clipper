@@ -121,8 +121,8 @@ details[open] > summary::before { content: "▾ "; }
 /* jobs */
 .jobs { display: grid; gap: 10px; }
 .job { padding: 14px 16px; }
-.job-head { display: flex; gap: 12px; align-items: center; }
-.job-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.job-head { display: flex; gap: 8px 12px; align-items: center; flex-wrap: wrap; }
+.job-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 160px; }
 .badge { font-size: 12px; font-weight: 650; padding: 2px 8px; border-radius: 99px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
 .badge.running { background: var(--accent-soft); color: var(--text); }
 .badge.done { color: var(--good); }

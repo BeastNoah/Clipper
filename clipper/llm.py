@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from .util import ClipperError, log
+from .util import ClipperError, log, run_proc
 
 T = TypeVar("T")
 
@@ -57,17 +57,17 @@ class Claude:
         # When clipper itself runs inside Claude Code, don't let the child join the parent's session.
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_SESSION_ID"}
         try:
-            proc = subprocess.run(cmd, input=message.encode(), capture_output=True,
-                                  cwd=self.cwd, env=env, timeout=self.timeout)
+            code, stdout, stderr = run_proc(cmd, input=message.encode(), cwd=self.cwd, env=env,
+                                            timeout=self.timeout)
         except subprocess.TimeoutExpired as e:
             raise ClipperError(f"claude did not answer within {self.timeout}s") from e
-        out = proc.stdout.decode(errors="replace")
+        out = stdout.decode(errors="replace")
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
-            err = (proc.stderr.decode(errors="replace") or out).strip()[-1500:]
-            raise ClipperError(f"claude failed (exit {proc.returncode}): {err}")
-        if data.get("is_error") or proc.returncode != 0:
+            err = (stderr.decode(errors="replace") or out).strip()[-1500:]
+            raise ClipperError(f"claude failed (exit {code}): {err}")
+        if data.get("is_error") or code != 0:
             raise ClipperError(f"claude returned an error: {str(data.get('result') or data)[:1500]}")
         return str(data.get("result", "")), data.get("session_id")
 

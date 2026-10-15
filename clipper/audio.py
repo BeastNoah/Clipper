@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import math
+import wave
 from pathlib import Path
 
 import numpy as np
 
-from .transcribe import SAMPLE_RATE, load_audio
+from .transcribe import SAMPLE_RATE
 
 FRAME = 0.05          # seconds per loudness measurement
 LOUD_DB = 6.0         # a sentence this much louder than typical speech is marked [loud]
@@ -16,19 +17,34 @@ QUIET_DB = 8.0        # a stretch this close to the silence floor is safe to cut
 
 
 class Loudness:
-    def __init__(self, samples: np.ndarray, rate: int = SAMPLE_RATE):
-        hop = int(rate * FRAME)
-        n = max(1, len(samples) // hop)
-        x = np.zeros(n * hop, np.float64)
-        x[:min(len(samples), n * hop)] = samples[:n * hop]
-        rms = np.sqrt((x.reshape(n, hop) ** 2).mean(axis=1) + 1e-12)
-        self.db = 20 * np.log10(rms)
+    def __init__(self, db: np.ndarray):
+        self.db = db if len(db) else np.zeros(1)
         self.floor = float(np.percentile(self.db, 10))
 
     @classmethod
+    def from_samples(cls, samples: np.ndarray, rate: int = SAMPLE_RATE) -> "Loudness":
+        hop = int(rate * FRAME)
+        n = len(samples) // hop
+        x = samples[:n * hop].astype(np.float32).reshape(n, hop)
+        return cls(10 * np.log10(np.mean(x * x, axis=1) + 1e-12))
+
+    @classmethod
     def from_work(cls, work: Path) -> "Loudness | None":
+        """Read audio.wav a minute at a time, so even a 3-hour stream needs little memory."""
         path = work / "audio.wav"
-        return cls(load_audio(path)) if path.exists() else None
+        if not path.exists():
+            return None
+        hop = int(SAMPLE_RATE * FRAME)
+        parts = []
+        with wave.open(str(path), "rb") as w:
+            while True:
+                raw = w.readframes(hop * 1200)
+                if len(raw) < 2 * hop:
+                    break
+                x = np.frombuffer(raw, np.int16)[: len(raw) // 2 // hop * hop].astype(np.float32) / 32768.0
+                x = x.reshape(-1, hop)
+                parts.append(10 * np.log10(np.mean(x * x, axis=1) + 1e-12))
+        return cls(np.concatenate(parts) if parts else np.zeros(1))
 
     def window(self, a: float, b: float) -> np.ndarray:
         i0 = max(0, int(a / FRAME))

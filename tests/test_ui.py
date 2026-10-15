@@ -38,8 +38,12 @@ def server(tmp_path, fake_claude):
 
 def call(port, method, path, body=None, headers=None):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-    data = json.dumps(body).encode() if isinstance(body, (dict, list)) else body
-    conn.request(method, path, body=data, headers=headers or {})
+    headers = dict(headers or {})
+    data = body
+    if isinstance(body, (dict, list)):
+        data = json.dumps(body).encode()
+        headers.setdefault("Content-Type", "application/json")
+    conn.request(method, path, body=data, headers=headers)
     r = conn.getresponse()
     raw = r.read()
     try:
@@ -74,6 +78,12 @@ def test_ui_api(server):
     status, up, _ = call(port, "PUT", "/api/upload?name=../../evil%20name.mp4", body=b"x" * 1000,
                          headers={"Content-Length": "1000"})
     assert status == 201 and up["path"] == str(work.parent / "_uploads" / "evil_name.mp4")
+
+    # other web pages can't drive the API: wrong Host (DNS rebinding), foreign Origin, form posts
+    assert call(port, "GET", "/api/videos", headers={"Host": "evil.example"})[0] == 403
+    assert call(port, "POST", "/api/jobs", {"kind": "nope"}, headers={"Origin": "https://evil.example"})[0] == 403
+    assert call(port, "POST", "/api/jobs", b'{"kind": "process", "source": "x"}',
+                headers={"Content-Type": "text/plain"})[0] == 415
 
     assert call(port, "POST", "/api/jobs", {"kind": "nope"})[0] == 400
     assert call(port, "POST", "/api/jobs", {"kind": "render", "video": vid, "items": []})[0] == 400

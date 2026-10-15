@@ -57,6 +57,10 @@ def make_style(preset: str = "bold", *, font: str | None = None, size: int | Non
     if preset not in PRESETS:
         raise ValueError(f"unknown caption style '{preset}' (choose from {', '.join(PRESETS)})")
     style = PRESETS[preset]
+    if size is not None and not 20 <= size <= 200:
+        raise ValueError("caption size must be between 20 and 200 pixels")
+    if highlight:
+        _bgr(highlight)  # raises for anything that isn't #RRGGBB
     changes = {"uppercase": uppercase, "position": position}
     if font:
         changes["font"] = font
@@ -92,9 +96,10 @@ def map_words(words: list[dict], start: float, edit: EditMap) -> list[dict]:
     out = []
     for w in words:
         text = w["w"].strip()
+        if not text or edit.is_cut((w["s"] + w["e"]) / 2 - start):
+            continue
         s, e = edit.to_output(w["s"] - start), edit.to_output(w["e"] - start)
-        if text and e - s >= 0.02:
-            out.append({"w": text, "s": s, "e": e})
+        out.append({"w": text, "s": s, "e": max(e, s + 0.05)})  # very short words still get a moment
     return out
 
 
