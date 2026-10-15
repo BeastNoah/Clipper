@@ -160,7 +160,8 @@ details[open] > summary::before { content: "▾ "; }
 .tabs button.active { background: var(--panel); color: var(--text); box-shadow: var(--shadow); }
 .review { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); gap: 24px; align-items: start; }
 .side { position: sticky; top: 76px; display: grid; gap: 16px; }
-.player { width: 100%; aspect-ratio: 16 / 9; background: #000; border-radius: 12px; display: block; }
+.player { width: 100%; aspect-ratio: 16 / 9; background: #000; border: 0; border-radius: 12px; display: block; }
+.player.audio { aspect-ratio: auto; height: 54px; background: none; }
 .preview-label { font-size: 13px; color: var(--muted); min-height: 20px; }
 .transcript { max-height: 38vh; overflow: auto; padding: 4px; }
 .sent { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 14px; }

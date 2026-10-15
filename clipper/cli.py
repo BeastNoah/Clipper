@@ -63,6 +63,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--crf", type=int, default=d.crf, help="x264 quality, lower is better (default 20)")
     g.add_argument("--preset", default=d.preset, help="x264 speed preset (default medium)")
     g.add_argument("--no-posts", action="store_true", help="don't write post text and hashtags")
+    g.add_argument("--download", default=d.download, choices=("sections", "full"),
+                   help="for links: 'sections' downloads the audio first and then only the video of the "
+                        "chosen clips (much faster for long videos); 'full' downloads the whole video "
+                        "(default sections)")
     g.add_argument("--work-dir", default=d.work_dir, help="where results are kept (default ./work)")
     g.add_argument("--force", choices=STEPS, metavar="STEP",
                    help=f"redo this step and every step after it ({', '.join(STEPS)})")
@@ -73,6 +77,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
 def options_from_args(args: argparse.Namespace) -> Options:
     return Options(
         num_clips=args.num_clips, min_len=args.min_len, max_len=args.max_len, work_dir=args.work_dir,
+        download=args.download,
         model=args.model, whisper_model=args.whisper_model, whisper_backend=args.whisper_backend,
         language=args.language, caption_model=args.caption_model, caption_style=args.caption_style,
         font=args.font, caption_size=args.caption_size, highlight_color=args.highlight_color,

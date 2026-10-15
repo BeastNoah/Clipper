@@ -10,11 +10,15 @@ import sys
 import tempfile
 from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .edit import EditMap
 from .util import ClipperError, Progress, fingerprint, log, read_frames, read_json, run, write_json
+
+if TYPE_CHECKING:
+    from .ingest import ClipVideo
 
 RENDER_VERSION = 2
 OUT_W, OUT_H = 1080, 1920
@@ -123,10 +127,10 @@ def _audio_filter(edit: EditMap) -> list[str]:
     return ["-filter_complex", ";".join(parts), "-map", "[aout]"]
 
 
-def _encode(video: Path, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: Path, out: Path,
+def _encode(video: Path, offset: float, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: Path, out: Path,
             enc_args: list[str], cover_frame: Path) -> None:
     fps = Fraction(meta["fps"])
-    start, dur = clip["start"], clip["end"] - clip["start"]
+    start, dur = clip["start"] - offset, clip["end"] - clip["start"]  # in the video file's own time
     W, H, cw = plan["width"], plan["height"], plan["crop_w"]
     xs = plan["x"]
     audio = ["-map", "1:a:0"] if edit.is_identity else _audio_filter(edit)
@@ -191,7 +195,11 @@ def make_cover(clip_dir: Path) -> Path:
 
 
 def render(work: Path, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: Path, clip_dir: Path, *,
-           encoder: str = "x264", crf: int = 20, preset: str = "medium", force: bool = False) -> Path:
+           encoder: str = "x264", crf: int = 20, preset: str = "medium", force: bool = False,
+           src: "ClipVideo | None" = None) -> Path:
+    from .ingest import ClipVideo
+
+    src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
     out = clip_dir / "clip.mp4"
     stamp = clip_dir / "render.json"
     encoder = resolve_encoder(encoder)
@@ -200,6 +208,7 @@ def render(work: Path, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: P
         "version": RENDER_VERSION, "start": clip["start"], "end": clip["end"], "plan": fingerprint(plan),
         "edit": edit.segments, "captions": hashlib.sha1(ass.read_bytes()).hexdigest()[:12],
         "cover": hashlib.sha1((clip_dir / "cover.ass").read_bytes()).hexdigest()[:12], "encoder": enc_args,
+        "video": src.key(),
     }
     params = json.loads(json.dumps(params))  # tuples -> lists, to compare with the stored JSON
     if not force and out.exists() and stamp.exists() and read_json(stamp) == params:
@@ -209,7 +218,7 @@ def render(work: Path, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: P
     log(f"render #{clip['rank']}: encoding {edit.duration:.0f}s at {OUT_W}x{OUT_H} ({encoder})"
         + (f", {cut:.1f}s of pauses cut" if cut > 0.05 else ""))
     tmp = clip_dir / "clip.tmp.mp4"
-    _encode(work / "video.mp4", meta, clip, plan, edit, ass, tmp, enc_args, clip_dir / "cover_frame.png")
+    _encode(src.path, src.offset, meta, clip, plan, edit, ass, tmp, enc_args, clip_dir / "cover_frame.png")
     os.replace(tmp, out)
     make_cover(clip_dir)
     write_json(stamp, params)

@@ -42,7 +42,8 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
 - **Review:** with "Let me review the clips before rendering" ticked, clipper stops after Claude
   has made its suggestions. Each suggestion shows Claude's score and sub-scores, the hook, the
   highlight keywords and whether Claude thinks it repeats a better clip. You can preview it in
-  the player, tick the ones you want, rename them, and move the start or end by a sentence.
+  the player (for YouTube links that's YouTube's own player, since only the sound has been
+  downloaded at that point), tick the ones you want, rename them, and move the start or end by a sentence.
   Click two sentences in the transcript to add a clip of your own.
 - **Render:** renders the ticked clips. Jobs run one at a time and show progress, a time
   estimate and the log; they can be cancelled.
@@ -87,6 +88,7 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--encoder` | `x264` | `videotoolbox` uses the Mac's hardware encoder: much faster, slightly bigger files |
 | `--crf` / `--preset` | 20 / medium | x264 quality and speed |
 | `--no-posts` | | don't write post text |
+| `--download` | `sections` | for links: `sections` downloads the audio, then only the video of the chosen clips; `full` downloads the whole video |
 | `--work-dir` | `./work` | where results are kept |
 | `--force STEP` | | redo STEP and every step after it |
 | `--stop-after STEP` | | stop early, e.g. `--stop-after select` to see Claude's picks before rendering |
@@ -99,10 +101,15 @@ clipper runs in six steps. Each step saves its result in `work/<video_id>/`, so 
 anything already done. Changing only `--num-clips`, for example, reuses the download, the
 transcript and Claude's proposals.
 
-**1. Ingest** (`ingest.py`). Takes a local file, or downloads a URL with yt-dlp (best quality up
-to 1080p; playlists are expanded into their videos). ffmpeg converts it to H.264 at a constant
-frame rate, which keeps sound and picture in sync later, and pulls out the audio as a 16 kHz mono
-file for the speech recognizer.
+**1. Ingest** (`ingest.py`). For a link, clipper first downloads only the audio with yt-dlp:
+that's all the next two steps need, and it's a fraction of the size of the video. The picture is
+fetched later and only for the clips (plus 3 seconds around each): ffmpeg reads just that stretch
+of the stream, best quality up to 1080p, and the section's sound is matched against the full audio
+track so captions and cuts line up exactly. For a two-hour podcast that means a few minutes of
+video instead of gigabytes, and no re-encoding of the whole thing. `--download full` downloads and
+converts the whole video instead, as happens for local files: ffmpeg converts it to H.264 at a
+constant frame rate, which keeps sound and picture in sync later. Either way the audio is also
+saved as a 16 kHz mono file for the speech recognizer. Playlists are expanded into their videos.
 
 **2. Transcribe** (`transcribe.py`). Whisper writes down what's said, with a start and end time
 for every word: mlx-whisper on an Apple Silicon GPU, or faster-whisper on the CPU (the `small`
@@ -152,14 +159,17 @@ and writes a 1080×1920 MP4. A cover image and post text for each platform are w
 ```
 work/<video_id>/
   meta.json            size, frame rate, duration, title
-  video.mp4            normalised video
+  video.mp4            the whole video, normalised (local files and --download full)
+  audio_source.*       the downloaded sound (links)
+  thumb.jpg            the video's thumbnail (links)
   audio.wav            16 kHz mono audio
   transcript.json      every word with its start and end time
   select.json          Claude's proposals, trims, scores and re-scores
   clips.json           Claude's picks
   review.json          your picks from the web interface
   posts.json           post text per clip
-  clips/<start>-<end>/ per clip: words.json, reframe.json, captions.ass, clip.mp4, cover.jpg
+  clips/<start>-<end>/ per clip: section.mp4 (just this part of the video, for links), words.json,
+                       reframe.json, captions.ass, clip.mp4, cover.jpg
   output/              the finished clips, covers, post text and clips.json
 ```
 

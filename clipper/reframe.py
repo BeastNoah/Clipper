@@ -13,10 +13,14 @@ import urllib.request
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 
 from .util import ClipperError, Progress, cached, fingerprint, log, read_frames
+
+if TYPE_CHECKING:
+    from .ingest import ClipVideo
 
 REFRAME_VERSION = 2
 ANALYSIS_WIDTH = 960     # faces in a wide two-shot are only ~40px at 640
@@ -424,11 +428,17 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
 
 
 def reframe(work: Path, meta: dict, clip: dict, clip_dir: Path, words: list[dict] | None = None,
-            layout: str = "auto", force: bool = False) -> dict:
+            layout: str = "auto", force: bool = False, src: "ClipVideo | None" = None) -> dict:
+    from .ingest import ClipVideo
+
+    src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
     speech = [[round(w["s"], 2), round(w["e"], 2)] for w in words or []]
     params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"], "layout": layout,
-              "speech": fingerprint(speech),
-              "video": [meta["width"], meta["height"], meta["fps"], meta["duration"]]}
+              "speech": fingerprint(speech), "video": src.key()}
+    # The file may be a section of the video: work in its own time, which starts at src.offset.
+    local = [{**w, "s": w["s"] - src.offset, "e": w["e"] - src.offset} for w in words or []]
+    dims = {"width": src.width, "height": src.height, "fps": src.fps}
     return cached(clip_dir / "reframe.json", params,
-                  lambda: analyze(work / "video.mp4", meta, clip["start"], clip["end"], words, layout),
+                  lambda: analyze(src.path, dims, clip["start"] - src.offset, clip["end"] - src.offset,
+                                  local, layout),
                   force=force, label=f"reframe #{clip['rank']}")

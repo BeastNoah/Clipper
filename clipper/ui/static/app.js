@@ -191,6 +191,7 @@ function settingsFields(opts, keys) {
       ["auto", "follow the speaker", "split screen", "main person only"]),
     jump_cuts: () => sel("jump_cuts", "Jump cuts", C.jump_cuts, ["off", "pauses only", "pauses + filler words"]),
     encoder: () => sel("encoder", "Encoder", C.encoders, ["x264 (best quality)", "VideoToolbox (fast, Mac)", "auto"]),
+    download: () => sel("download", "Download from links", ["sections", "full"], ["only the clips' video (fast)", "the whole video"]),
     language: () => h("label", { class: "field" }, h("span", {}, "Language"),
       h("input", { type: "text", placeholder: "detect", value: opts.language || "", onchange: e => saveOption("language", e.target.value.trim() || null) })),
     uppercase: () => chk("uppercase", "Capital letters"),
@@ -261,7 +262,7 @@ async function renderHome() {
           "Let me review the clips before rendering")),
       h("details", {}, h("summary", {}, "More settings"),
         h("div", { class: "settings" }, ...settingsFields(opts, ["model", "whisper_model", "caption_model", "language",
-          "caption_style", "caption_position", "layout", "jump_cuts", "encoder"])),
+          "caption_style", "caption_position", "layout", "jump_cuts", "encoder", "download"])),
         h("div", { class: "row", style: "margin-top:14px; gap:22px" }, ...settingsFields(opts, ["uppercase", "title_overlay", "posts"]))),
     ),
     h("section", { id: "jobs-section", hidden: true }, h("h2", {}, "Jobs"), h("div", { class: "jobs", id: "jobs" })),
@@ -375,10 +376,7 @@ function renderVideo() {
 function reviewView() {
   const v = S.video, r = S.review;
   if (!r) return h("div", { class: "panel empty" }, "This video hasn't been transcribed yet.");
-  const player = h("video", { class: "player", id: "player", src: `/media/${v.id}/video.mp4`, controls: true, preload: "metadata" });
-  player.addEventListener("timeupdate", () => {
-    if (S.stopAt != null && player.currentTime >= S.stopAt) { player.pause(); S.stopAt = null; }
-  });
+  const player = makePlayer(v);
   const side = h("div", { class: "side" },
     h("div", { class: "panel player-panel", style: "padding:12px" }, player, h("div", { class: "preview-label", id: "preview-label", style: "margin-top:8px" }, "Click ▶ on a clip to preview it here.")),
     h("div", { class: "panel transcript-panel", style: "padding:12px 8px" },
@@ -393,13 +391,44 @@ function reviewView() {
   return h("div", {}, wrap, h("div", { class: "renderbar", id: "renderbar" }));
 }
 
-function preview(it, n) {
+// Without a downloaded video (only the clip sections get fetched), YouTube's own player previews the
+// moments; for other sites the downloaded sound does.
+function makePlayer(v) {
+  const sections = v.meta?.video === "sections";
+  if (sections && v.meta.youtube_id) {
+    return h("iframe", { class: "player", id: "player", title: "Preview", allowfullscreen: true,
+      allow: "autoplay; encrypted-media; picture-in-picture", src: youtubeSrc(v.meta.youtube_id, 0, null, false) });
+  }
+  const el = sections
+    ? h("audio", { class: "player audio", id: "player", src: `/media/${v.id}/audio.wav`, controls: true, preload: "metadata" })
+    : h("video", { class: "player", id: "player", src: `/media/${v.id}/video.mp4`, controls: true, preload: "metadata" });
+  el.addEventListener("timeupdate", () => {
+    if (S.stopAt != null && el.currentTime >= S.stopAt) { el.pause(); S.stopAt = null; }
+  });
+  return el;
+}
+
+function youtubeSrc(id, start, end, autoplay) {
+  const q = new URLSearchParams({ start: Math.floor(Math.max(0, start)), autoplay: autoplay ? 1 : 0, rel: 0, playsinline: 1 });
+  if (end != null) q.set("end", Math.ceil(end));
+  return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?${q}`;
+}
+
+function seekPlayer(t, stopAt, play) {
   const p = $("#player");
   if (!p) return;
+  if (p.tagName === "IFRAME") {
+    p.src = youtubeSrc(S.video.meta.youtube_id, t, stopAt, play);
+    return;
+  }
+  p.currentTime = Math.max(0, t);
+  S.stopAt = stopAt;
+  if (play) p.play().catch(() => {});
+}
+
+function preview(it, n) {
   const { start, end } = span(it);
-  p.currentTime = Math.max(0, start - 0.2);
-  S.stopAt = end + 0.4;
-  p.play().catch(() => {});
+  seekPlayer(start - 0.2, end + 0.4, true);
   $("#preview-label").textContent = `Previewing ${n ? `#${n}` : ""} “${it.title}” · ${fmt(start)}–${fmt(end)}`;
   S.review.focus = it.key;
   renderTranscript(true);
@@ -474,8 +503,7 @@ function renderTranscript(scroll) {
 
 function clickSentence(i) {
   const r = S.review;
-  const p = $("#player");
-  if (p) { p.currentTime = S.video.sentences[i].start; S.stopAt = null; }
+  seekPlayer(S.video.sentences[i].start, null, false);
   if (r.mark == null || r.markEnd != null || i < r.mark) { r.mark = i; r.markEnd = null; }
   else r.markEnd = i;
   r.focus = null;

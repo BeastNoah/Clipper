@@ -13,7 +13,7 @@ from .audio import Loudness
 from .captions import PRESETS, make_captions, make_style
 from .edit import MODES as JUMP_CUT_MODES
 from .edit import EditMap, plan_cuts
-from .ingest import ingest
+from .ingest import DOWNLOAD_MODES, clip_video, ingest
 from .llm import Claude
 from .posts import format_post, write_posts
 from .reframe import LAYOUTS, reframe
@@ -31,6 +31,7 @@ class Options:
     min_len: float = 20
     max_len: float = 60
     work_dir: str = "work"
+    download: str = "sections"          # links: sections (audio first, video only for the clips) | full
     model: str = "opus"                 # Claude model that picks the clips
     whisper_model: str = "small"
     whisper_backend: str = "auto"       # auto | faster-whisper | mlx
@@ -62,6 +63,7 @@ class Options:
             ("caption style", self.caption_style, tuple(PRESETS)), ("jump cuts", self.jump_cuts, JUMP_CUT_MODES),
             ("layout", self.layout, LAYOUTS), ("encoder", self.encoder, ENCODERS),
             ("caption position", self.caption_position, ("lower", "middle")),
+            ("download", self.download, DOWNLOAD_MODES),
             ("whisper backend", self.whisper_backend, ("auto", "faster-whisper", "mlx")),
             ("force", self.force, (None, *STEPS)), ("stop after", self.stop_after, (None, *STEPS)),
         ]:
@@ -133,7 +135,8 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         cdir.mkdir(parents=True, exist_ok=True)
         words = clip_words(work, transcript, clip, cdir, opts.caption_model, opts.whisper_backend,
                            force=opts.forced("captions"))
-        plan = reframe(work, meta, clip, cdir, words, opts.layout, force=opts.forced("reframe"))
+        src = clip_video(work, meta, clip, cdir)
+        plan = reframe(work, meta, clip, cdir, words, opts.layout, force=opts.forced("reframe"), src=src)
         edit = EditMap(plan_cuts(words, clip["start"], clip["end"], fps, opts.jump_cuts,
                                  loud.is_quiet if loud else None))
         ass = make_captions(clip, words, edit, cdir, style, opts.title_overlay)
@@ -141,7 +144,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         if not do_render:
             continue
         mp4 = render(work, meta, clip, plan, edit, ass, cdir, encoder=opts.encoder, crf=opts.crf,
-                     preset=opts.preset, force=opts.forced("render"))
+                     preset=opts.preset, force=opts.forced("render"), src=src)
         name = f"{clip['rank']:02d}_{slugify(clip['title'])}"
         _publish(mp4, out_dir / f"{name}.mp4")
         _publish(cdir / "cover.jpg", out_dir / f"{name}.jpg")
@@ -168,7 +171,7 @@ def process(source: str, opts: Options) -> tuple[Path, list[dict]]:
         require_tool(tool)
     work_root = Path(opts.work_dir)
     report("step", "ingest")
-    work, meta = ingest(source, work_root, force=opts.forced("ingest"))
+    work, meta = ingest(source, work_root, force=opts.forced("ingest"), download_mode=opts.download)
     report("video", work.name)
     if opts.stop_after == "ingest":
         return work, []

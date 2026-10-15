@@ -181,6 +181,8 @@ def video_detail(work: Path) -> dict:
 
 
 def frame_jpeg(work: Path, t: float, width: int = 360) -> Path:
+    if not (work / "video.mp4").exists():
+        return work / "thumb.jpg"  # only the audio was downloaded: use the video's thumbnail
     thumbs = work / "thumbs"
     thumbs.mkdir(exist_ok=True)
     out = thumbs / f"{int(t * 1000)}_{width}.jpg"
@@ -339,7 +341,8 @@ class Handler(BaseHTTPRequestHandler):
         if parts[0] == "media" and len(parts) >= 3:
             work = self._work(parts[1])
             rel = parts[2:]
-            if work is None or not (rel == ["video.mp4"] or (len(rel) == 2 and rel[0] == "output"
+            if work is None or not (rel in (["video.mp4"], ["audio.wav"], ["thumb.jpg"])
+                                    or (len(rel) == 2 and rel[0] == "output"
                                                               and re.match(r"^[\w.-]+$", rel[1]))):
                 return self._error(404, "not found")
             return self._file(work.joinpath(*rel))
