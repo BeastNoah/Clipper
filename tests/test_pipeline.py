@@ -20,7 +20,7 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
     work_root = tmp_path / "work"
     def args(n, *extra):
         return [str(src), "--work-dir", str(work_root), "-n", str(n), "--min-len", "8", "--max-len", "12",
-                "--preset", "ultrafast", *extra]
+                "--preset", "ultrafast", "--caption-model", "none", *extra]
 
     assert cli.main(args(2, "--stop-after", "ingest")) == 0
     (work,) = work_root.iterdir()
@@ -31,7 +31,8 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
 
     words = make_words([f"This is spoken sentence number {i} today." for i in range(14)], start=0.5)
     write_json(work / "transcript.json", {
-        "params": {"version": 1, "model": "small", "language": None, "duration": round(meta["duration"], 2)},
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
         "result": {"language": "en", "model": "small", "words": words},
     })
 
@@ -46,6 +47,10 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
         assert 8 <= float(info["format"]["duration"]) <= 12.5
     clips = json.loads((work / "output" / "clips.json").read_text())
     assert [c["rank"] for c in clips] == [1, 2]
+    for c in clips:  # cover image and post text next to each clip
+        assert (work / "output" / c["cover"]).stat().st_size > 1000
+        assert "#fyp" in (work / "output" / c["file"]).with_suffix(".txt").read_text()
+        assert c["post"]["youtube_title"]
 
     # No faces in a test pattern: every shot falls back to the full frame on a blurred background.
     plan = json.loads(next((work / "clips").glob("*/reframe.json")).read_text())["result"]

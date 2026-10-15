@@ -1,12 +1,14 @@
 import json
+import re
 
 import pytest
 
 from clipper.llm import Claude, InvalidReply
 from clipper.select import (
-    CHUNK_SECONDS, Timeline, make_chunks, parse_proposals, parse_rescores, resolve_overlaps,
-    select_clips, snap_and_fit, split_sentences,
+    CHUNK_SECONDS, Timeline, clips_from_review, make_chunks, parse_proposals, parse_rescores,
+    resolve_overlaps, select_clips, snap_and_fit, split_sentences,
 )
+from clipper.util import ClipperError
 from conftest import make_words
 
 
@@ -158,3 +160,72 @@ def test_bad_answer_is_sent_back_for_a_retry(tmp_path, fake_claude, monkeypatch)
     assert second["argv"][second["argv"].index("--resume") + 1] == session
     assert "not JSON" in second["prompt"]
     assert first["argv"][first["argv"].index("--tools") + 1] == ""
+
+
+def test_claude_chooses_where_to_shorten_long_clips(tmp_path, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_LONG", "1")
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(120)])
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    clips = select_clips(tmp_path, meta, {"words": words}, num_clips=2, min_len=15, max_len=30,
+                         model="test", claude_factory=lambda: Claude("test"))
+    trims = [c for c in _calls(fake_claude) if '<clip id="' in c["prompt"]]
+    assert len(trims) == 1
+    state = json.loads((tmp_path / "select.json").read_text())
+    assert all(c["trimmed_by_claude"] for c in state["candidates"])
+    # the fake editor dropped each clip's first line, so the clip no longer starts where proposed
+    assert all(c["start"] > c["proposed"][0] for c in state["candidates"])
+    assert all(15 <= c["duration"] <= 30 for c in clips)
+
+
+def test_duplicates_and_keywords(tmp_path, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_DUP", "1")
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(700)])
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    select_clips(tmp_path, meta, {"words": words}, num_clips=30, min_len=20, max_len=45,
+                 model="test", claude_factory=lambda: Claude("test"))
+    state = json.loads((tmp_path / "select.json").read_text())
+    c1, c2 = state["candidates"][:2]
+    assert c2["duplicate_of"] == c1["id"]
+    clips = json.loads((tmp_path / "clips.json").read_text())
+    assert c2["id"] not in [c["id"] for c in clips]  # a duplicate never makes it into the final set
+    assert all(c["keywords"] and c["keywords"][0].lower() in c["text"].lower() for c in clips)
+    assert all({"si", "ei"} <= set(c) for c in clips)
+
+
+def test_audio_cues_reach_the_prompt(tmp_path, fake_claude):
+    import numpy as np
+    import wave
+
+    words = make_words([f"Sentence {i} is spoken here." for i in range(20)])
+    words = [dict(w, s=w["s"] + (3 if i >= 25 else 0), e=w["e"] + (3 if i >= 25 else 0))
+             for i, w in enumerate(words)]  # a 3s gap after sentence 5 ...
+    rate = 16000
+    audio = np.zeros(int((words[-1]["e"] + 1) * rate), np.int16)
+    for w in words:
+        audio[int(w["s"] * rate):int(w["e"] * rate)] = 3000
+    gap0 = words[24]["e"]
+    audio[int((gap0 + 0.3) * rate):int((gap0 + 2.6) * rate)] = 2500  # ... filled with laughter-like sound
+    with wave.open(str(tmp_path / "audio.wav"), "wb") as wf:
+        wf.setnchannels(1), wf.setsampwidth(2), wf.setframerate(rate)
+        wf.writeframes(audio.tobytes())
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    select_clips(tmp_path, meta, {"words": words}, num_clips=1, min_len=5, max_len=20,
+                 model="test", claude_factory=lambda: Claude("test"))
+    prompt = next(c["prompt"] for c in _calls(fake_claude) if "<transcript>" in c["prompt"])
+    assert re.search(r"Sentence 4 is spoken here\. \[\+3\.\ds non-speech sound\]", prompt)
+    assert "non-speech sound] means" in prompt
+
+
+def test_review_items_become_clips():
+    words = make_words([f"This is sentence {i} of the test." for i in range(30)])
+    meta = {"duration": words[-1]["e"] + 1}
+    cand = {"id": "c7", "si": 3, "ei": 6, "title": "Claude's title", "hook": "This is sentence 3 of the test.",
+            "score": 70, "scores": {}, "keywords": ["sentence 5", "missing"]}
+    clips = clips_from_review({"words": words}, meta, [cand], [
+        {"id": "c7", "si": 4, "ei": 6}, {"si": 10, "ei": 12, "title": "Mine"}])
+    assert [c["rank"] for c in clips] == [1, 2]
+    assert clips[0]["title"] == "Claude's title" and clips[0]["keywords"] == ["sentence 5"]
+    assert clips[0]["hook"] == "This is sentence 4 of the test."  # the start moved, so the hook did too
+    assert clips[1]["title"] == "Mine" and clips[1]["id"] == "u10-12"
+    with pytest.raises(ClipperError):
+        clips_from_review({"words": words}, meta, [], [{"si": 5, "ei": 99}])

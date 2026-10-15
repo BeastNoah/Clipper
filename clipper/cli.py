@@ -1,125 +1,138 @@
-"""Command line entry point: runs the six steps in order, reusing whatever is already in work/<video_id>/."""
+"""Command line: `clipper SOURCE...`, `clipper ui` and `clipper doctor`."""
 
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
 import sys
 from pathlib import Path
 
-from .captions import make_captions
-from .ingest import ingest
-from .llm import Claude
-from .reframe import reframe
-from .render import check_ffmpeg_has_libass, render
-from .select import select_clips
-from .transcribe import transcribe
-from .util import ClipperError, fmt_time, log, require_tool, slugify, write_json
+from .captions import PRESETS
+from .edit import MODES as JUMP_CUT_MODES
+from .ingest import expand_sources
+from .pipeline import STEPS, Options, process
+from .reframe import LAYOUTS
+from .render import ENCODERS
+from .util import ClipperError, fmt_time, log
 
-STEPS = ["ingest", "transcribe", "select", "reframe", "captions", "render"]
+USAGE = """\
+clipper SOURCE [SOURCE ...] [options]   make clips from files, URLs or playlists
+clipper ui [--port N] [--work-dir DIR]   open the web interface
+clipper doctor                           check that everything clipper needs is installed"""
+
+
+def _bool(value: str) -> bool:
+    return value.lower() in ("1", "yes", "on", "true")
 
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(prog="clipper", description="Turn one long video into short vertical clips.")
-    p.add_argument("source", help="a local video file or a URL (anything yt-dlp can download)")
-    p.add_argument("-n", "--num-clips", type=int, default=3, help="how many clips to make (default 3)")
-    p.add_argument("--min-len", type=float, default=20, help="shortest clip in seconds (default 20)")
-    p.add_argument("--max-len", type=float, default=60, help="longest clip in seconds (default 60)")
-    p.add_argument("--work-dir", type=Path, default=Path("work"), help="where results are kept (default ./work)")
-    p.add_argument("--whisper-model", default="small",
-                   help="faster-whisper model: tiny, base, small, medium, large-v3 ... (default small)")
-    p.add_argument("--language", default=None, help="spoken language code, e.g. en or de (default: detect)")
-    p.add_argument("--model", default="opus", help="Claude model used to pick clips (default opus)")
-    p.add_argument("--font", default="Arial Black", help="caption font (default Arial Black)")
-    p.add_argument("--crf", type=int, default=20, help="x264 quality, lower is better (default 20)")
-    p.add_argument("--preset", default="medium", help="x264 speed preset (default medium)")
-    p.add_argument("--force", choices=STEPS, metavar="STEP",
+    d = Options()
+    p = argparse.ArgumentParser(prog="clipper", usage=USAGE,
+                                description="Turn long videos into short vertical clips.")
+    p.add_argument("sources", nargs="+", metavar="SOURCE",
+                   help="video files or URLs (anything yt-dlp can download, including playlists)")
+    g = p.add_argument_group("clips")
+    g.add_argument("-n", "--num-clips", type=int, default=d.num_clips, help="clips per video (default 3)")
+    g.add_argument("--min-len", type=float, default=d.min_len, help="shortest clip in seconds (default 20)")
+    g.add_argument("--max-len", type=float, default=d.max_len, help="longest clip in seconds (default 60)")
+    g.add_argument("--model", default=d.model, help="Claude model that picks the clips (default opus)")
+    g = p.add_argument_group("speech")
+    g.add_argument("--whisper-model", default=d.whisper_model,
+                   help="model for the full transcript: tiny, base, small, medium, large-v3, turbo (default small)")
+    g.add_argument("--caption-model", default=d.caption_model,
+                   help="bigger model that re-transcribes just the chosen clips for accurate captions, "
+                        "or 'none' (default turbo)")
+    g.add_argument("--whisper-backend", default=d.whisper_backend, choices=("auto", "faster-whisper", "mlx"),
+                   help="auto uses mlx-whisper on Apple Silicon when installed (default auto)")
+    g.add_argument("--language", default=None, help="spoken language code, e.g. en or de (default: detect)")
+    g = p.add_argument_group("look")
+    g.add_argument("--caption-style", default=d.caption_style, choices=tuple(PRESETS), help="(default bold)")
+    g.add_argument("--font", default=None, help="caption font (default depends on the style)")
+    g.add_argument("--caption-size", type=int, default=None, help="caption font size in pixels")
+    g.add_argument("--highlight-color", default=None, help="colour of the spoken word, e.g. '#FFE600'")
+    g.add_argument("--uppercase", action="store_true", help="captions in capital letters")
+    g.add_argument("--caption-position", default=d.caption_position, choices=("lower", "middle"))
+    g.add_argument("--no-title", action="store_true", help="don't show the clip title at the start")
+    g.add_argument("--jump-cuts", default=d.jump_cuts, choices=JUMP_CUT_MODES,
+                   help="cut out long pauses and filler words (on), only pauses, or nothing (default on)")
+    g.add_argument("--layout", default=d.layout, choices=LAYOUTS,
+                   help="two people in a shot: follow whoever talks, split screen, auto, or only the "
+                        "main person (default auto)")
+    g = p.add_argument_group("output")
+    g.add_argument("--encoder", default=d.encoder, choices=ENCODERS,
+                   help="x264 (best quality per MB) or videotoolbox (Mac hardware, much faster) (default x264)")
+    g.add_argument("--crf", type=int, default=d.crf, help="x264 quality, lower is better (default 20)")
+    g.add_argument("--preset", default=d.preset, help="x264 speed preset (default medium)")
+    g.add_argument("--no-posts", action="store_true", help="don't write post text and hashtags")
+    g.add_argument("--work-dir", default=d.work_dir, help="where results are kept (default ./work)")
+    g.add_argument("--force", choices=STEPS, metavar="STEP",
                    help=f"redo this step and every step after it ({', '.join(STEPS)})")
-    p.add_argument("--stop-after", choices=STEPS, metavar="STEP", help="stop after this step")
-    args = p.parse_args(argv)
-    if args.num_clips < 1:
-        p.error("--num-clips must be at least 1")
-    if args.min_len <= 0 or args.max_len < args.min_len:
-        p.error("--min-len must be positive and no larger than --max-len")
-    return args
+    g.add_argument("--stop-after", choices=STEPS, metavar="STEP", help="stop after this step")
+    return p.parse_args(argv)
 
 
-def _publish(src: Path, dest: Path) -> None:
-    if dest.exists():
-        dest.unlink()
-    try:
-        os.link(src, dest)
-    except OSError:
-        shutil.copy2(src, dest)
+def options_from_args(args: argparse.Namespace) -> Options:
+    return Options(
+        num_clips=args.num_clips, min_len=args.min_len, max_len=args.max_len, work_dir=args.work_dir,
+        model=args.model, whisper_model=args.whisper_model, whisper_backend=args.whisper_backend,
+        language=args.language, caption_model=args.caption_model, caption_style=args.caption_style,
+        font=args.font, caption_size=args.caption_size, highlight_color=args.highlight_color,
+        uppercase=args.uppercase, caption_position=args.caption_position, title_overlay=not args.no_title,
+        jump_cuts=args.jump_cuts, layout=args.layout, encoder=args.encoder, crf=args.crf, preset=args.preset,
+        posts=not args.no_posts, force=args.force, stop_after=args.stop_after,
+    ).validate()
 
 
-def run(args: argparse.Namespace) -> list[dict]:
-    for tool in ("ffmpeg", "ffprobe"):
-        require_tool(tool)
-
-    def forced(step: str) -> bool:
-        return args.force is not None and STEPS.index(step) >= STEPS.index(args.force)
-
-    def stop(step: str) -> bool:
-        return args.stop_after == step
-
-    work, meta = ingest(args.source, args.work_dir, force=forced("ingest"))
-    if stop("ingest"):
-        return []
-    transcript = transcribe(work, meta, args.whisper_model, args.language, force=forced("transcribe"))
-    if stop("transcribe"):
-        return []
-    clips = select_clips(
-        work, meta, transcript, num_clips=args.num_clips, min_len=args.min_len, max_len=args.max_len,
-        model=args.model, claude_factory=lambda: Claude(args.model, cwd=work), force=forced("select"),
-    )
-    if not clips:
-        raise ClipperError("Claude didn't find any usable clips in this video.")
-    if stop("select"):
-        return clips
-
-    do_render = args.stop_after not in ("reframe", "captions")
-    if do_render:
-        check_ffmpeg_has_libass()
+def _summary(work: Path, clips: list[dict]) -> None:
     out_dir = work / "output"
-    out_dir.mkdir(exist_ok=True)
-    for old in out_dir.glob("*.mp4"):
-        old.unlink()
+    for c in clips:
+        line = f"{c['rank']:2d}. [{c['score'] if c.get('score') is not None else '-':>3}] " \
+               f"{fmt_time(c['start'])}-{fmt_time(c['end'])}  {c['title']}"
+        if c.get("file"):
+            line += f"\n    {out_dir / c['file']}"
+        print(line)
 
-    for clip in clips:
-        clip_dir = work / "clips" / f"{round(clip['start'] * 1000):08d}-{round(clip['end'] * 1000):08d}"
-        clip_dir.mkdir(parents=True, exist_ok=True)
-        plan = reframe(work, meta, clip, clip_dir, force=forced("reframe"))
-        ass = make_captions(transcript, clip, clip_dir, args.font)
-        if not do_render:
+
+def run_sources(args: argparse.Namespace) -> int:
+    opts = options_from_args(args)
+    sources = expand_sources(args.sources)
+    failed = []
+    for n, source in enumerate(sources, 1):
+        if len(sources) > 1:
+            log(f"=== video {n} of {len(sources)}: {source}")
+        try:
+            work, clips = process(source, opts)
+        except ClipperError as e:
+            if len(sources) == 1:
+                raise
+            log(f"error: {e}")
+            failed.append(source)
             continue
-        mp4 = render(work, meta, clip, plan, ass, clip_dir, crf=args.crf, preset=args.preset,
-                     force=forced("captions"))
-        final = out_dir / f"{clip['rank']:02d}_{slugify(clip['title'])}.mp4"
-        _publish(mp4, final)
-        clip["file"] = str(final)
-
-    write_json(out_dir / "clips.json", clips)
-    if do_render:
-        log(f"done: {len(clips)} clip(s) in {out_dir}")
-        for c in clips:
-            print(f"{c['rank']:2d}. [{c['score']:3d}] {fmt_time(c['start'])}-{fmt_time(c['end'])}  "
-                  f"{c['title']}\n    {c['file']}")
-    return clips
+        if clips:
+            if clips[0].get("file"):
+                log(f"done: {len(clips)} clip(s) in {work / 'output'}")
+            _summary(work, clips)
+    if failed:
+        log(f"{len(failed)} of {len(sources)} videos failed: " + ", ".join(failed))
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+    argv = sys.argv[1:] if argv is None else argv
     try:
-        run(args)
+        if argv[:1] == ["doctor"]:
+            from .doctor import doctor
+            return doctor(argv[1:])
+        if argv[:1] == ["ui"]:
+            from .ui.server import serve
+            return serve(argv[1:])
+        return run_sources(parse_args(argv))
     except ClipperError as e:
         print(f"clipper: error: {e}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        print("clipper: interrupted; finished steps are saved and will be reused", file=sys.stderr)
+        print("\nclipper: interrupted; finished steps are saved and will be reused", file=sys.stderr)
         return 130
-    return 0
 
 
 if __name__ == "__main__":

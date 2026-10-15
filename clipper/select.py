@@ -15,10 +15,11 @@ from typing import Callable
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .audio import Loudness, sentence_cues
 from .llm import Claude, InvalidReply, extract_json
-from .util import ClipperError, fingerprint, fmt_time, log, read_json, write_json
+from .util import Cancelled, ClipperError, fingerprint, fmt_time, log, read_json, write_json
 
-SELECT_VERSION = 1
+SELECT_VERSION = 2
 CHUNK_SECONDS = 15 * 60
 MAX_SENTENCE_SECONDS = 15.0  # longer "sentences" (run-ons, missing punctuation) get split
 SENTENCE_GAP = 2.0           # a pause this long ends a sentence even without punctuation
@@ -146,6 +147,7 @@ class ProposedClip(BaseModel):
     title: str = Field(min_length=1, max_length=120)
     hook: str = Field(min_length=1)
     scores: SubScores
+    keywords: list[str] = Field(default_factory=list, max_length=5)
 
 
 class ProposalReply(BaseModel):
@@ -154,10 +156,21 @@ class ProposalReply(BaseModel):
 
 class Rescore(SubScores):
     id: str
+    duplicate_of: str | None = None
 
 
 class RescoreReply(BaseModel):
     scores: list[Rescore]
+
+
+class Trim(BaseModel):
+    id: str
+    first: int
+    last: int
+
+
+class TrimReply(BaseModel):
+    trims: list[Trim]
 
 
 def _validate(model: type[BaseModel], reply: str) -> BaseModel:
@@ -194,9 +207,39 @@ def parse_rescores(reply: str, ids: list[str]) -> dict[str, dict]:
     dupes = sorted({i for i in got if got.count(i) > 1})
     if dupes:
         problems.append("scored more than once: " + ", ".join(dupes))
+    for s in parsed.scores:
+        if s.duplicate_of is not None and (s.duplicate_of not in ids or s.duplicate_of == s.id):
+            problems.append(f"{s.id}: duplicate_of must be the id of another clip in the list, or null")
     if problems:
         raise InvalidReply("; ".join(problems) + ". Give exactly one entry per clip id.")
     return {s.id: s.model_dump(exclude={"id"}) for s in parsed.scores}
+
+
+def parse_trims(reply: str, jobs: dict[str, tuple[int, int]], tl: "Timeline", min_len: float,
+                max_len: float) -> dict[str, tuple[int, int]]:
+    """Validate Claude's choice of which lines to keep: {trim id: (first, last)} with 1-based lines."""
+    parsed = _validate(TrimReply, reply)
+    got = {t.id: t for t in parsed.trims}
+    problems = []
+    missing = [i for i in jobs if i not in got]
+    if missing:
+        problems.append("missing: " + ", ".join(missing))
+    for tid, t in got.items():
+        if tid not in jobs:
+            problems.append(f"unknown id {tid}")
+            continue
+        si, ei = jobs[tid]
+        n = ei - si + 1
+        if not 1 <= t.first <= t.last <= n:
+            problems.append(f"{tid}: first and last must be line numbers with 1 <= first <= last <= {n}")
+            continue
+        length = tl.sentences[si + t.last - 1].end - tl.sentences[si + t.first - 1].start
+        if not min_len <= length <= max_len - 0.6:
+            problems.append(f"{tid}: lines {t.first}-{t.last} run {length:.1f}s, which is outside "
+                            f"{min_len:.0f}-{max_len - 1:.0f}s")
+    if problems:
+        raise InvalidReply("; ".join(problems))
+    return {tid: (t.first, t.last) for tid, t in got.items()}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -233,15 +276,19 @@ class Timeline:
         return "".join(w["w"] for w in self.words[a:b + 1]).strip()
 
 
-def snap_and_fit(tl: Timeline, start: float, end: float, min_len: float, max_len: float) -> tuple[int, int] | None:
-    """Move a proposal to sentence boundaries, then trim or extend it to fit the length limits.
+def snap(tl: Timeline, start: float, end: float) -> tuple[int, int]:
+    """Move a proposal's start and end to the nearest sentence boundaries."""
+    si = tl.nearest_start(start)
+    return si, tl.nearest_end(end, si)
+
+
+def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float) -> tuple[int, int] | None:
+    """Trim or extend sentences si..ei to fit the length limits.
 
     Trimming happens at the end (the start holds the hook). Extending adds the next sentence,
     or the previous one when there is no room after. Returns None if the clip can't be made to fit.
     """
     n = len(tl.sentences)
-    si = tl.nearest_start(start)
-    ei = tl.nearest_end(end, si)
     while ei > si and tl.dur(si, ei) > max_len:
         ei -= 1
     if tl.dur(si, ei) > max_len:
@@ -256,21 +303,64 @@ def snap_and_fit(tl: Timeline, start: float, end: float, min_len: float, max_len
     return si, ei
 
 
+def snap_and_fit(tl: Timeline, start: float, end: float, min_len: float, max_len: float) -> tuple[int, int] | None:
+    return fit(tl, *snap(tl, start, end), min_len, max_len)
+
+
 def resolve_overlaps(cands: list[dict]) -> list[dict]:
-    """Where clips overlap, keep the higher-scoring one."""
+    """Where clips overlap, or Claude marked two as telling the same story, keep the higher-scoring one."""
     kept: list[dict] = []
     for c in sorted(cands, key=lambda c: (-c["score"], c["start"])):
-        if all(c["end"] <= k["start"] or c["start"] >= k["end"] for k in kept):
+        clash = any(
+            not (c["end"] <= k["start"] or c["start"] >= k["end"])
+            or (c.get("duplicate_of") is not None and c.get("duplicate_of") == k.get("id"))
+            or (k.get("duplicate_of") is not None and k.get("duplicate_of") == c.get("id"))
+            for k in kept
+        )
+        if not clash:
             kept.append(c)
     return kept
+
+
+def make_clip(tl: Timeline, rank: int, si: int, ei: int, base: dict | None = None,
+              title: str | None = None) -> dict:
+    """The clip record used by every later step (also for clips picked or edited in the UI)."""
+    base = base or {}
+    text = tl.text(si, ei)
+    start, end = round(tl.clip_start(si), 3), round(tl.clip_end(ei), 3)
+    same_start = base.get("si") == si
+    return {
+        "rank": rank,
+        "id": base.get("id") or f"u{si}-{ei}",
+        "title": (title or base.get("title") or tl.sentences[si].text[:50]).strip(),
+        "hook": base.get("hook") if same_start and base.get("hook") else tl.sentences[si].text,
+        "score": base.get("score"),
+        "scores": base.get("scores"),
+        "start": start, "end": end, "duration": round(end - start, 3),
+        "si": si, "ei": ei,
+        "text": text,
+        "keywords": [k for k in base.get("keywords", []) if k.lower() in text.lower()],
+    }
+
+
+def timeline_for(transcript: dict, meta: dict) -> Timeline:
+    words = transcript["words"]
+    return Timeline(split_sentences(words), words, meta["duration"])
 
 
 # ---------------------------------------------------------------------------------------------
 # Orchestration
 
+CUE_NOTE = """\
+Some lines end with notes in square brackets taken from the audio: [loud] means it was said \
+noticeably louder than usual; [+1.8s non-speech sound] means a sound without speech follows \
+(often laughter or applause); [pause 2.1s] means silence follows."""
+
+
 def _proposal_prompt(title: str, tl: Timeline, a: int, b: int, count: int, min_len: float,
-                     max_len: float, avoid: list[tuple[float, float]]) -> str:
-    lines = "\n".join(f"{s.start:.1f}-{s.end:.1f} | {s.text}" for s in tl.sentences[a:b + 1])
+                     max_len: float, avoid: list[tuple[float, float]], cues: dict[int, str]) -> str:
+    lines = "\n".join(f"{s.start:.1f}-{s.end:.1f} | {s.text}{cues.get(s.i, '')}" for s in tl.sentences[a:b + 1])
+    has_cues = any(i in cues for i in range(a, b + 1))
     lo, hi = tl.sentences[a].start, tl.sentences[b].end
     avoid_txt = ""
     if avoid:
@@ -287,12 +377,12 @@ start and end time in seconds, then the text.
 <transcript>
 {lines}
 </transcript>
-
+{CUE_NOTE if has_cues else ""}
 Find up to {count} of the best moments in this part to cut into standalone short clips.
 - Each clip must be {min_len:.0f}-{max_len:.0f} seconds long; around {target} seconds is ideal.
 - Start on the sentence that grabs attention (the hook), never in the middle of a thought.
 - End when the idea or story pays off.
-- Clips must not overlap each other.
+- Clips must not overlap each other, and each must be about a different point or story.
 - Use the start time of the clip's first line and the end time of its last line, exactly as written.
 - Only propose clips that are genuinely good. Fewer is fine; an empty list is fine.
 {avoid_txt}
@@ -301,8 +391,11 @@ Find up to {count} of the best moments in this part to cut into standalone short
 Reply with only a JSON object in exactly this format:
 {{"clips": [{{"start": 123.4, "end": 161.0, "title": "Short catchy title", \
 "hook": "The opening line, quoted from the transcript", \
-"scores": {{"hook": 20, "standalone": 18, "emotion": 15, "clarity": 22}}}}]}}
-Write the title in the language of the video, at most 60 characters."""
+"scores": {{"hook": 20, "standalone": 18, "emotion": 15, "clarity": 22}}, \
+"keywords": ["the word that lands"]}}]}}
+- title: in the language of the video, at most 50 characters; it is shown on screen as the clip starts.
+- keywords: 1-3 words or short phrases from the clip that carry its punch; they get highlighted \
+in the captions."""
 
 
 def _rescore_prompt(title: str, cands: list[dict]) -> str:
@@ -324,8 +417,34 @@ with each other.
 {blocks}
 </clips>
 
+If a clip makes the same point or tells the same story as a better clip in the list, set its \
+"duplicate_of" to that better clip's id; otherwise set it to null.
+
 Reply with only a JSON object with one entry for every clip id above, in exactly this format:
-{{"scores": [{{"id": "{cands[0]['id']}", "hook": 20, "standalone": 18, "emotion": 15, "clarity": 22}}]}}"""
+{{"scores": [{{"id": "{cands[0]['id']}", "hook": 20, "standalone": 18, "emotion": 15, "clarity": 22, \
+"duplicate_of": null}}]}}"""
+
+
+def _trim_prompt(title: str, tl: Timeline, jobs: dict[str, tuple[int, int, str]], min_len: float,
+                 max_len: float) -> str:
+    blocks = []
+    for tid, (si, ei, clip_title) in jobs.items():
+        t0 = tl.sentences[si].start
+        lines = "\n".join(f"{n}. [{s.start - t0:.1f}-{s.end - t0:.1f}] {s.text}"
+                          for n, s in enumerate(tl.sentences[si:ei + 1], 1))
+        blocks.append(f'<clip id="{tid}" title="{clip_title}">\n{lines}\n</clip>')
+    example = next(iter(jobs))
+    return f"""\
+Video title: {title}
+
+These clips came out too long once aligned to whole sentences. For each one, choose a single \
+continuous run of its numbered lines to keep: start on a strong hook, keep the payoff, and make \
+it {min_len:.0f}-{max_len - 1:.0f} seconds long (the times are seconds from the start of the clip).
+
+{chr(10).join(blocks)}
+
+Reply with only a JSON object with one entry per clip, in exactly this format:
+{{"trims": [{{"id": "{example}", "first": 1, "last": 9}}]}}"""
 
 
 class Selector:
@@ -336,10 +455,12 @@ class Selector:
         if not self.sentences:
             raise ClipperError("The transcript is empty.")
         self.tl = Timeline(self.sentences, words, meta["duration"])
+        self.cues = sentence_cues(Loudness.from_work(work), words, self.sentences, meta["duration"])
         self.title = meta.get("title", "")
         self.min_len, self.max_len = min_len, max_len
         self.chunks = make_chunks(self.sentences, overlap=max_len + 30)
         self._claude_factory, self._claude = claude_factory, None
+        self._pending: list[tuple[dict, str, int, int]] = []
         self.path = work / "select.json"
         params = {"version": SELECT_VERSION, "transcript": fingerprint(words), "min_len": min_len,
                   "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks]}
@@ -362,11 +483,19 @@ class Selector:
         return self.sentences[a].start, self.sentences[b].end
 
     def _add(self, proposal: dict, call: str) -> None:
-        fit = snap_and_fit(self.tl, proposal["start"], proposal["end"], self.min_len, self.max_len)
-        if fit is None:
+        si, ei = snap(self.tl, proposal["start"], proposal["end"])
+        if ei > si and self.tl.dur(si, ei) > self.max_len:
+            self._pending.append((proposal, call, si, ei))  # Claude decides what to cut, see _trim
+        else:
+            self._commit(proposal, call, si, ei)
+
+    def _commit(self, proposal: dict, call: str, si: int, ei: int, trimmed: bool = False) -> None:
+        fitted = fit(self.tl, si, ei, self.min_len, self.max_len)
+        if fitted is None:
             log(f"select: dropped \"{proposal['title']}\": can't fit {self.min_len:.0f}-{self.max_len:.0f}s")
             return
-        si, ei = fit
+        si, ei = fitted
+        text = self.tl.text(si, ei)
         cands = self.state["candidates"]
         cands.append({
             "id": f"c{len(cands) + 1}",
@@ -375,12 +504,41 @@ class Selector:
             "hook": proposal["hook"].strip(),
             "scores": proposal["scores"],
             "score": sum(proposal["scores"].values()),
+            "keywords": [k.strip() for k in proposal.get("keywords", [])
+                         if k.strip() and k.strip().lower() in text.lower()][:3],
             "proposed": [proposal["start"], proposal["end"]],
+            "trimmed_by_claude": trimmed,
             "si": si, "ei": ei,
             "start": round(self.tl.clip_start(si), 3),
             "end": round(self.tl.clip_end(ei), 3),
-            "text": self.tl.text(si, ei),
+            "text": text,
         })
+
+    def _trim(self) -> None:
+        """Ask Claude which sentences to keep for proposals that ran over the maximum length."""
+        if not self._pending:
+            return
+        jobs = {f"t{n}": item for n, item in enumerate(self._pending, 1)}
+        self._pending = []
+        log(f"select: asking Claude where to shorten {len(jobs)} clip(s) longer than {self.max_len:.0f}s")
+        spans = {tid: (si, ei) for tid, (_, _, si, ei) in jobs.items()}
+        prompt = _trim_prompt(self.title, self.tl, {tid: (si, ei, p["title"]) for tid, (p, _, si, ei) in jobs.items()},
+                              self.min_len, self.max_len)
+        try:
+            trims = self.claude.ask(SYSTEM_PROMPT, prompt,
+                                    lambda r: parse_trims(r, spans, self.tl, self.min_len, self.max_len),
+                                    what="trimming")
+        except Cancelled:
+            raise
+        except ClipperError as e:
+            log(f"select: {e}; trimming from the end instead")
+            trims = {}
+        for tid, (proposal, call, si, ei) in jobs.items():
+            if tid in trims:
+                first, last = trims[tid]
+                self._commit(proposal, call, si + first - 1, si + last - 1, trimmed=True)
+            else:
+                self._commit(proposal, call, si, ei)
 
     def _round(self, key: str, count_for_chunk: Callable[[int], int], with_avoid: bool) -> None:
         for k, (a, b) in enumerate(self.chunks):
@@ -399,11 +557,13 @@ class Selector:
             count = count_for_chunk(k)
             where = f"chunk {k + 1}/{len(self.chunks)}" if len(self.chunks) > 1 else "transcript"
             log(f"select: asking Claude for up to {count} clips ({where}, {fmt_time(lo)}-{fmt_time(hi)})")
-            prompt = _proposal_prompt(self.title, self.tl, a, b, count, self.min_len, self.max_len, avoid)
+            prompt = _proposal_prompt(self.title, self.tl, a, b, count, self.min_len, self.max_len, avoid,
+                                      self.cues)
             proposals = self.claude.ask(SYSTEM_PROMPT, prompt, lambda r: parse_proposals(r, lo, hi),
                                         what=f"proposals for {where}")
             for p in proposals[:count]:
                 self._add(p, call)
+            self._trim()
             self.state["done"].append(call)
             self._save()
 
@@ -421,8 +581,10 @@ class Selector:
             self.state["rescored"] = {key: scores}  # only the latest set is ever needed again
             self._save()
         for c in cands:
-            c["scores"] = scores[c["id"]]
-            c["score"] = sum(scores[c["id"]].values())
+            sc = dict(scores[c["id"]])
+            c["duplicate_of"] = sc.pop("duplicate_of", None)
+            c["scores"] = sc
+            c["score"] = sum(sc.values())
 
     def _survivors(self) -> list[dict]:
         self._rescore()
@@ -451,12 +613,7 @@ class Selector:
 
         if len(survivors) < num_clips:
             log(f"select: found {len(survivors)} good clips (asked for {num_clips})")
-        picked = survivors[:num_clips]
-        return [
-            {"rank": n, **{k: c[k] for k in ("id", "title", "hook", "score", "scores", "start", "end", "text")},
-             "duration": round(c["end"] - c["start"], 3)}
-            for n, c in enumerate(picked, 1)
-        ]
+        return [make_clip(self.tl, n, c["si"], c["ei"], c) for n, c in enumerate(survivors[:num_clips], 1)]
 
 
 def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, min_len: float,
@@ -472,3 +629,17 @@ def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, mi
         log(f"select: #{c['rank']} [{c['score']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} "
             f"({c['duration']:.0f}s) {c['title']}")
     return clips
+
+
+def clips_from_review(transcript: dict, meta: dict, candidates: list[dict], items: list[dict]) -> list[dict]:
+    """Clips chosen and adjusted by hand: items are {"id"?, "si", "ei", "title"?} in the wanted order."""
+    tl = timeline_for(transcript, meta)
+    by_id = {c["id"]: c for c in candidates}
+    n = len(tl.sentences)
+    out = []
+    for rank, item in enumerate(items, 1):
+        si, ei = int(item["si"]), int(item["ei"])
+        if not 0 <= si <= ei < n:
+            raise ClipperError(f"Clip {rank}: sentences {si}-{ei} are outside the transcript")
+        out.append(make_clip(tl, rank, si, ei, by_id.get(item.get("id")), item.get("title")))
+    return out

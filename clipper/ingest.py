@@ -51,6 +51,26 @@ def _yt_dlp():
     return yt_dlp
 
 
+def expand_sources(sources: list[str]) -> list[str]:
+    """Replace playlist and channel URLs by the URLs of their videos."""
+    out = []
+    for src in sources:
+        if not is_url(src):
+            out.append(src)
+            continue
+        yt_dlp = _yt_dlp()
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": "in_playlist"}) as ydl:
+            info = ydl.extract_info(src, download=False)
+        if info.get("_type") == "playlist":
+            urls = [e.get("url") or e.get("webpage_url") for e in info.get("entries") or []]
+            urls = [u for u in urls if u]
+            log(f"ingest: playlist '{info.get('title') or src}' has {len(urls)} videos")
+            out += urls
+        else:
+            out.append(src)
+    return out
+
+
 def url_video_id(url: str) -> tuple[str, dict]:
     yt_dlp = _yt_dlp()
     with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "noplaylist": True}) as ydl:

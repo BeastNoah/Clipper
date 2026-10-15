@@ -63,3 +63,69 @@ def test_frame_builders_make_vertical_frames():
     y0 = (OUT_H - fh) // 2
     assert np.abs(out[y0 + 10:y0 + fh - 10].astype(int).mean() - frame.mean()) < 3  # sharp copy in the middle
     assert out[:y0 - 5].mean() < frame.mean() * 0.7                                 # darkened blur above
+
+
+from clipper.reframe import mouth_activity, plan_shot, speaker_turns
+
+
+def test_speaker_turns_follow_the_moving_mouth_and_ignore_blips():
+    n = 60
+    a = np.array([5.0] * 30 + [0.5] * 30)
+    b = np.array([0.5] * 30 + [5.0] * 30)
+    a[45] = 9.0  # a one-sample twitch while the other person talks
+    turns = speaker_turns(a, b, np.ones(n, bool))
+    assert turns[0] == 0 and turns[-1] == 1
+    assert int(np.count_nonzero(np.diff(turns))) == 1
+    # nobody speaking: keep whoever spoke last
+    speech = np.ones(n, bool)
+    speech[30:] = False
+    assert (speaker_turns(a, b, speech)[30:] == 0).all()
+
+
+def test_mouth_activity_ignores_head_movement():
+    rng = np.random.default_rng(1)
+    still = rng.integers(0, 255, (200, 200), dtype=np.uint8)
+    talking = still.copy()
+    talking[115:140, 85:115] = 255 - talking[115:140, 85:115]  # only the mouth area changes
+    box = (100, 100, 60, 80)
+    assert mouth_activity(talking, still, box) > 50
+    shifted = np.roll(still, 3, axis=1)  # the whole head moves
+    assert mouth_activity(shifted, still, box) < 15
+
+
+def _two_people(n, act_left, act_right, gap=1000):
+    left = (500.0, 500.0, 160.0, 160.0)
+    right = (500.0 + gap, 500.0, 160.0, 160.0)
+    return [[(*left, act_left[k]), (*right, act_right[k])] for k in range(n)]
+
+
+def test_two_far_apart_people_follow_the_speaker_or_split():
+    n, fps = 60, 30
+    frames = [k * 6 for k in range(n)]
+    act_l = [6.0] * 30 + [0.2] * 30
+    act_r = [0.2] * 30 + [6.0] * 30
+    samples = _two_people(n, act_l, act_r)
+    mode, xs, info = plan_shot(samples, frames, 0, 360, 1920, 1080, 608, fps, "follow", [True] * n)
+    assert mode == "follow" and info["switches"] == 1
+    assert xs[0] == 500 - 304 and xs[-1] == 1500 - 304  # left person first, then a cut to the right
+
+    mode, vals, _ = plan_shot(samples, frames, 0, 360, 1920, 1080, 608, fps, "split", [True] * n)
+    assert mode == "split" and len(vals[0]) == 5
+    xl, yl, xr, yr, hc = vals[0]
+    assert xl < 500 < xl + hc * 9 / 8 and xr < 1500 < xr + hc * 9 / 8
+
+    # auto: one long turn each is "follow"; quick back-and-forth becomes a split screen
+    assert plan_shot(samples, frames, 0, 360, 1920, 1080, 608, fps, "auto", [True] * n)[0] == "follow"
+    act_l = ([6.0] * 8 + [0.2] * 8) * 4
+    act_r = ([0.2] * 8 + [6.0] * 8) * 4
+    samples = _two_people(64, act_l, act_r)
+    frames = [k * 6 for k in range(64)]
+    assert plan_shot(samples, frames, 0, 384, 1920, 1080, 608, fps, "auto", [True] * 64)[0] == "split"
+
+
+def test_two_people_close_together_are_framed_together():
+    n = 20
+    samples = _two_people(n, [1.0] * n, [1.0] * n, gap=250)
+    mode, xs, info = plan_shot(samples, [k * 6 for k in range(n)], 0, 120, 1920, 1080, 608, 30, "auto", [True] * n)
+    assert mode == "track" and info["framing"] == "together"
+    assert xs[0] == 625 - 304

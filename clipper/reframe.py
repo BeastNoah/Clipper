@@ -1,8 +1,9 @@
 """Step 4: decide where the 9:16 window sits in every frame of a clip.
 
-Per clip: find camera cuts, detect faces 5 times a second, follow the main person in each shot
-with a calm virtual camera, and fall back to "full frame on a blurred background" for shots
-without a clear face.
+Per clip: find camera cuts and detect faces 5 times a second. In each shot, follow the main person
+with a calm virtual camera. When two people share a shot, watch whose mouth moves while someone is
+speaking and cut to them, or stack both on a split screen when they talk back and forth. Shots
+without a clear face show the full frame on a blurred background.
 """
 
 from __future__ import annotations
@@ -15,10 +16,10 @@ from pathlib import Path
 
 import numpy as np
 
-from .util import ClipperError, cached, log, read_frames
+from .util import ClipperError, Progress, cached, fingerprint, log, read_frames
 
-REFRAME_VERSION = 1
-ANALYSIS_WIDTH = 640
+REFRAME_VERSION = 2
+ANALYSIS_WIDTH = 960     # faces in a wide two-shot are only ~40px at 640
 SAMPLE_FPS = 5
 
 # Cut detection (same idea as PySceneDetect's adaptive detector): a frame-to-frame change that is
@@ -33,6 +34,12 @@ MIN_PRESENCE = 0.35     # the main face must be in at least this share of a shot
 TRACK_MAX_GAP = 5       # samples a face may vanish for and still be the same track
 DEADZONE = 0.12         # of crop width; the camera ignores head movements smaller than this
 MOVE_MIN_S, MOVE_MAX_S = 0.6, 1.6
+
+SECOND_PERSON = 0.6     # a second face at least this big (relative to the main one) is a co-speaker
+MIN_TURN_SAMPLES = 5    # a speaker must talk ~1s before the camera cuts to them
+BANTER_WINDOW_S = 6.0   # two or more changes of speaker within this window counts as back-and-forth
+MIN_LAYOUT_S = 4.0      # don't switch between split screen and single framing more often than this
+LAYOUTS = ("auto", "follow", "split", "main")
 
 YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
              "face_detection_yunet_2023mar.onnx")
@@ -108,14 +115,14 @@ class FaceDetector:
 
 @dataclass
 class Track:
-    boxes: dict[int, tuple[float, float, float, float]] = field(default_factory=dict)  # sample -> box
+    boxes: dict[int, tuple] = field(default_factory=dict)  # sample -> (cx, cy, w, h, mouth activity)
 
     @property
     def last(self) -> int:
         return max(self.boxes)
 
 
-def build_tracks(samples: list[list[tuple[float, float, float, float]]]) -> list[Track]:
+def build_tracks(samples: list[list[tuple]]) -> list[Track]:
     """Link face detections across samples: a face continues a track if its centre is within about
     one face-width of where that track was last seen."""
     tracks: list[Track] = []
@@ -123,8 +130,8 @@ def build_tracks(samples: list[list[tuple[float, float, float, float]]]) -> list
         active = [t for t in tracks if k - t.last <= TRACK_MAX_GAP]
         pairs = []
         for ti, t in enumerate(active):
-            tx, ty, tw, _ = t.boxes[t.last]
-            for bi, (bx, by, bw, _) in enumerate(boxes):
+            tx, ty, tw = t.boxes[t.last][:3]
+            for bi, (bx, by, bw, *_) in enumerate(boxes):
                 d = np.hypot(bx - tx, by - ty) / max(tw, bw)
                 if d < 1.0:
                     pairs.append((d, ti, bi))
@@ -140,17 +147,81 @@ def build_tracks(samples: list[list[tuple[float, float, float, float]]]) -> list
     return tracks
 
 
+def _median(t: Track, k: int) -> float:
+    return float(np.median([b[k] for b in t.boxes.values()]))
+
+
+def people(tracks: list[Track], n_samples: int) -> list[Track]:
+    """Faces on screen often enough to matter, most important first (biggest x most often)."""
+    keep = [t for t in tracks if len(t.boxes) / n_samples >= MIN_PRESENCE]
+    return sorted(keep, key=lambda t: -(len(t.boxes) / n_samples) * _median(t, 2))
+
+
 def main_track(tracks: list[Track], n_samples: int) -> Track | None:
     """The face that is biggest and on screen most often, if it's on screen often enough."""
-    best, best_score = None, 0.0
-    for t in tracks:
-        presence = len(t.boxes) / n_samples
-        if presence < MIN_PRESENCE:
-            continue
-        score = presence * float(np.median([b[2] for b in t.boxes.values()]))
-        if score > best_score:
-            best, best_score = t, score
-    return best
+    found = people(tracks, n_samples)
+    return found[0] if found else None
+
+
+def mouth_activity(gray: np.ndarray, earlier: np.ndarray, box: tuple) -> float:
+    """How much the mouth area changed between two nearby frames, minus how much the eyes did
+    (so nodding or moving the whole head doesn't count as talking)."""
+    cx, cy, w, h = box[:4]
+    H, W = gray.shape
+
+    def change(y0: float, y1: float, half_w: float) -> float:
+        xa, xb = max(0, int(cx - half_w * w)), min(W, int(cx + half_w * w))
+        ya, yb = max(0, int(cy + y0 * h)), min(H, int(cy + y1 * h))
+        if xb - xa < 2 or yb - ya < 2:
+            return 0.0
+        return float(np.abs(gray[ya:yb, xa:xb].astype(np.int16) - earlier[ya:yb, xa:xb]).mean())
+
+    return max(0.0, change(0.15, 0.5, 0.3) - change(-0.3, -0.05, 0.35))
+
+
+def _merge_short_runs(values: np.ndarray, min_run: int) -> np.ndarray:
+    """Absorb runs shorter than min_run into the run before them (or after, at the start)."""
+    out = values.copy()
+    for _ in range(2):
+        bounds = [0, *(np.flatnonzero(np.diff(out)) + 1), len(out)]
+        for i in range(len(bounds) - 1):
+            lo, hi = bounds[i], bounds[i + 1]
+            if hi - lo < min_run and len(bounds) > 2:
+                out[lo:hi] = out[lo - 1] if lo > 0 else out[hi]
+    return out
+
+
+def banter(turns: np.ndarray, sample_fps: float = SAMPLE_FPS) -> np.ndarray:
+    """Per sample: are the two people going back and forth right now?"""
+    n = len(turns)
+    switched = np.zeros(n)
+    switched[1:] = np.diff(turns) != 0
+    total = np.concatenate([[0], np.cumsum(switched)])
+    half = int(BANTER_WINDOW_S * sample_fps / 2)
+    busy = np.array([total[min(n, j + half + 1)] - total[max(0, j - half)] >= 2 for j in range(n)])
+    return _merge_short_runs(busy.astype(int), int(MIN_LAYOUT_S * sample_fps)).astype(bool)
+
+
+def _smooth(a: np.ndarray, n: int) -> np.ndarray:
+    if len(a) < 2:
+        return a.astype(float)
+    k = min(n, len(a))
+    return np.convolve(np.pad(a.astype(float), (k // 2, k - 1 - k // 2), mode="edge"), np.ones(k) / k, "valid")
+
+
+def speaker_turns(act_a: np.ndarray, act_b: np.ndarray, speech: np.ndarray,
+                  min_run: int = MIN_TURN_SAMPLES) -> np.ndarray:
+    """0 or 1 per sample: which of two people is talking. Decided only while someone speaks, with
+    short turns merged away so the camera doesn't flicker between them."""
+    sa, sb = _smooth(act_a, 7), _smooth(act_b, 7)
+    decided = [0 if x > 1.25 * y + 0.05 else 1 if y > 1.25 * x + 0.05 else -1 for x, y in zip(sa, sb)]
+    first = next((d for d, sp in zip(decided, speech) if sp and d >= 0), 0)
+    cur, out = first, []
+    for d, sp in zip(decided, speech):
+        if sp and d >= 0:
+            cur = d
+        out.append(cur)
+    return _merge_short_runs(np.array(out, int), min_run)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -228,7 +299,70 @@ def camera_path(sample_frames: list[int], centers: list[float | None], first: in
 
 # ---------------------------------------------------------------------------------------------
 
-def analyze(video: Path, meta: dict, start: float, end: float) -> dict:
+def _even(x: float) -> int:
+    return int(round(x / 2)) * 2
+
+
+def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: int, H: int, cw: int,
+              fps: float, layout: str, speaking: list[bool]) -> tuple[str, list | None, dict]:
+    """Framing for frames a..b-1 of one shot: ("fit", None), or a mode with one value per frame."""
+    n = len(samples)
+    found = people(build_tracks(samples), n) if n else []
+    if not found:
+        return "fit", None, {}
+
+    def centers(t: Track) -> list[float | None]:
+        return [t.boxes[j][0] if j in t.boxes else None for j in range(n)]
+
+    main = found[0]
+    other = next((t for t in found[1:] if _median(t, 2) >= SECOND_PERSON * _median(main, 2)), None)
+    if other is None or layout == "main":
+        return "track", camera_path(frames, centers(main), a, b - 1, W, cw, fps), \
+            {"presence": round(len(main.boxes) / n, 2)}
+
+    left, right = sorted([main, other], key=lambda t: _median(t, 0))
+    span = _median(right, 0) - _median(left, 0) + max(_median(left, 2), _median(right, 2))
+    if span <= 0.8 * cw and layout != "split":  # both fit in one window: frame them together
+        mid = [(lc + rc) / 2 if lc is not None and rc is not None else lc if lc is not None else rc
+               for lc, rc in zip(centers(left), centers(right))]
+        return "track", camera_path(frames, mid, a, b - 1, W, cw, fps), {"people": 2, "framing": "together"}
+
+    act = [np.array([t.boxes[j][4] if j in t.boxes else 0.0 for j in range(n)]) for t in (left, right)]
+    turns = speaker_turns(act[0], act[1], np.array(speaking))
+    spoken = turns[np.array(speaking)] if any(speaking) else turns
+    share = float(spoken.mean()) if len(spoken) else 0.0
+    switches = int(np.count_nonzero(np.diff(turns)))
+    info = {"people": 2, "right_speaks": round(share, 2), "switches": switches}
+
+    def per_frame(per_sample: list) -> list:
+        out, k = [], 0
+        for f in range(a, b):
+            while k + 1 < n and frames[k + 1] <= f:
+                k += 1
+            out.append(per_sample[k](f - a))
+        return out
+
+    paths = [camera_path(frames, centers(t), a, b - 1, W, cw, fps) for t in (left, right)]
+    follow = per_frame([lambda i, sp=int(sp): paths[sp][i] for sp in turns])
+    if layout == "follow":
+        return "follow", follow, info
+
+    hc = min(H, max(_even(0.4 * H), _even(3.5 * max(_median(left, 3), _median(right, 3)))))
+    wc = min(W, _even(hc * 9 / 8))
+    xs = [camera_path(frames, centers(t), a, b - 1, W, wc, fps) for t in (left, right)]
+    ys = [int(min(max(_median(t, 1) - 0.42 * hc, 0), H - hc)) for t in (left, right)]
+    split = [[xl, ys[0], xr, ys[1], hc] for xl, xr in zip(*xs)]
+    busy = np.ones(n, bool) if layout == "split" else banter(turns)
+    if busy.all():
+        return "split", split, info
+    if not busy.any():
+        return "follow", follow, info
+    mixed = per_frame([lambda i, on=bool(on): split[i] if on else follow[i] for on in busy])
+    return "follow+split", mixed, info
+
+
+def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict] | None = None,
+            layout: str = "auto") -> dict:
     import cv2
 
     W, H = meta["width"], meta["height"]
@@ -239,17 +373,25 @@ def analyze(video: Path, meta: dict, start: float, end: float) -> dict:
     scale = W / aw
     step = max(1, round(fps / SAMPLE_FPS))
     detector = FaceDetector(aw, ah) if cw < W else None
+    talk = sorted((w["s"] - start - 0.15, w["e"] - start + 0.15) for w in words or [])
 
-    changes, sample_frames, samples, prev = [], [], [], None
+    changes, sample_frames, samples, prev, grays = [], [], [], None, []
     n = 0
+    progress = Progress("reframe", (end - start) * fps)
     for n, frame in enumerate(read_frames(video, start, end - start, aw, ah, scale=True), 1):
+        progress.update(n)
         small = cv2.cvtColor(cv2.resize(frame, (128, 72), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2HSV)
         small = small.astype(np.int16)
         changes.append(0.0 if prev is None else float(np.abs(small - prev).mean()))
         prev = small
-        if detector and (n - 1) % step == 0:
+        if detector is None:
+            continue
+        grays = (grays + [cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)])[-3:]
+        if (n - 1) % step == 0:
             sample_frames.append(n - 1)
-            samples.append(detector.detect(frame))
+            boxes = detector.detect(frame)
+            samples.append([(*bx, mouth_activity(grays[-1], grays[0], bx)) for bx in boxes])
+    Progress.clear_line()
 
     if n == 0:
         raise ClipperError(f"No video frames between {start:.1f}s and {end:.1f}s")
@@ -260,25 +402,28 @@ def analyze(video: Path, meta: dict, start: float, end: float) -> dict:
         if b <= a:
             continue
         idx = [k for k, f in enumerate(sample_frames) if a <= f < b]
-        track = main_track(build_tracks([samples[k] for k in idx]), len(idx)) if idx else None
-        if track is None:
-            shots.append({"start": a, "end": b, "mode": "fit"})
-            continue
         frames = [sample_frames[k] for k in idx]
-        centers = [track.boxes[j][0] * scale if j in track.boxes else None for j in range(len(idx))]
-        xs[a:b] = camera_path(frames, centers, a, b - 1, W, cw, fps)
-        shots.append({"start": a, "end": b, "mode": "track",
-                      "presence": round(len(track.boxes) / len(idx), 2)})
+        shot_samples = [[(bx[0] * scale, bx[1] * scale, bx[2] * scale, bx[3] * scale, bx[4]) for bx in samples[k]]
+                        for k in idx]
+        speaking = [any(t0 <= f / fps <= t1 for t0, t1 in talk) for f in frames]
+        mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, layout, speaking)
+        if values is not None:
+            xs[a:b] = values
+        shots.append({"start": a, "end": b, "mode": mode, **info})
 
-    tracked = sum(s["end"] - s["start"] for s in shots if s["mode"] == "track")
-    log(f"reframe: {len(shots)} shot(s), following a face in {tracked / max(n, 1):.0%} of frames"
-        + (f" ({detector.kind} detector)" if detector else ""))
+    framed = sum(s["end"] - s["start"] for s in shots if s["mode"] != "fit")
+    modes = sorted({s["mode"] for s in shots})
+    log(f"reframe: {len(shots)} shot(s) ({', '.join(modes)}), a face is framed in {framed / max(n, 1):.0%} "
+        f"of frames" + (f" ({detector.kind} detector)" if detector else ""))
     return {"width": W, "height": H, "crop_w": cw, "frames": n, "shots": shots, "x": xs}
 
 
-def reframe(work: Path, meta: dict, clip: dict, clip_dir: Path, force: bool = False) -> dict:
-    params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"],
+def reframe(work: Path, meta: dict, clip: dict, clip_dir: Path, words: list[dict] | None = None,
+            layout: str = "auto", force: bool = False) -> dict:
+    speech = [[round(w["s"], 2), round(w["e"], 2)] for w in words or []]
+    params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"], "layout": layout,
+              "speech": fingerprint(speech),
               "video": [meta["width"], meta["height"], meta["fps"], meta["duration"]]}
     return cached(clip_dir / "reframe.json", params,
-                  lambda: analyze(work / "video.mp4", meta, clip["start"], clip["end"]),
+                  lambda: analyze(work / "video.mp4", meta, clip["start"], clip["end"], words, layout),
                   force=force, label=f"reframe #{clip['rank']}")

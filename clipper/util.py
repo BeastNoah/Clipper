@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from fractions import Fraction
 from pathlib import Path
@@ -22,8 +23,76 @@ class ClipperError(RuntimeError):
     """An error we can explain to the user without a traceback."""
 
 
+class Cancelled(ClipperError):
+    pass
+
+
+# Per-thread hooks so the web UI can watch (and cancel) a pipeline running in a worker thread.
+_local = threading.local()
+
+
+def set_reporter(sink: Callable[[str, Any], None] | None, cancel: threading.Event | None = None) -> None:
+    """sink(kind, payload) receives ("log", text), ("progress", {...}) and ("step", name) events."""
+    _local.sink, _local.cancel = sink, cancel
+
+
+def report(kind: str, payload: Any) -> None:
+    sink = getattr(_local, "sink", None)
+    if sink is not None:
+        sink(kind, payload)
+
+
+def check_cancel() -> None:
+    ev = getattr(_local, "cancel", None)
+    if ev is not None and ev.is_set():
+        raise Cancelled("Cancelled")
+
+
 def log(msg: str) -> None:
+    Progress.clear_line()
     print(f"[clipper] {msg}", file=sys.stderr, flush=True)
+    report("log", msg)
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    return f"{m}m {s:02d}s" if m < 60 else f"{m // 60}h {m % 60:02d}m"
+
+
+class Progress:
+    """A one-line progress display with a time estimate (and a cancellation point for the UI)."""
+
+    _on_line = False
+
+    def __init__(self, label: str, total: float):
+        self.label, self.total = label, max(float(total), 1e-9)
+        self.t0 = self.last = time.monotonic()
+        self.tty = sys.stderr.isatty()
+
+    def update(self, done: float) -> None:
+        check_cancel()
+        now = time.monotonic()
+        if now - self.last < (0.3 if self.tty else 15):
+            return
+        self.last = now
+        frac = min(max(done / self.total, 0.0), 1.0)
+        eta = (now - self.t0) * (1 - frac) / frac if frac > 0.02 else None
+        text = f"{self.label}: {frac:4.0%}" + (f", about {fmt_duration(eta)} left" if eta is not None else "")
+        report("progress", {"label": self.label, "fraction": round(frac, 4), "eta": eta})
+        if self.tty:
+            print(f"\r[clipper] {text}   ", end="", file=sys.stderr, flush=True)
+            Progress._on_line = True
+        else:
+            print(f"[clipper] {text}", file=sys.stderr, flush=True)
+
+    @classmethod
+    def clear_line(cls) -> None:
+        if cls._on_line:
+            print("\r\033[K", end="", file=sys.stderr, flush=True)
+            cls._on_line = False
 
 
 def require_tool(name: str) -> str:
