@@ -106,3 +106,49 @@ def test_ui_api(server):
     assert detail["review"]["items"][0]["si"] == 1
     status, body, _ = call(port, "GET", f"/media/{vid}/output/{clip['file']}")
     assert status == 200 and len(body) > 10000
+
+
+def test_phone_mode_needs_the_key(tmp_path):
+    from clipper.ui.server import lan_ip, phone_key
+
+    ip = lan_ip()
+    if ip is None:
+        pytest.skip("no network address to test from")
+    root = tmp_path / "work"
+    work = root / "talk-1234abcd"
+    work.mkdir(parents=True)
+    write_json(work / "meta.json", {"title": "Talk", "duration": 10})
+    (work / "video.mp4").write_bytes(b"v" * 5000)
+    key = phone_key(root)
+    assert phone_key(root) == key and phone_key(root, renew=True) != key  # kept, unless renewed
+    key = phone_key(root)
+    httpd = ThreadingHTTPServer(("0.0.0.0", 0), type("H", (Handler,), {"app": App(root, key, "http://x/?key=" + key)}))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+
+    def lan(method, path, headers=None):
+        conn = http.client.HTTPConnection(ip, port, timeout=10)
+        conn.request(method, path, headers=headers or {})
+        r = conn.getresponse()
+        return r.status, r.read(), r
+
+    try:
+        status, body, _ = lan("GET", "/")
+        assert status == 403 and b"access link" in body           # a friendly page, not the app
+        assert lan("GET", "/api/videos")[0] == 403
+        assert lan("GET", "/?key=wrong")[0] == 403
+        status, _, r = lan("GET", f"/?key={key}")
+        assert status == 303 and r.getheader("Location") == "/"
+        cookie = r.getheader("Set-Cookie").split(";")[0]
+        assert cookie == f"clipper_key={key}" and "HttpOnly" in r.getheader("Set-Cookie")
+        status, body, _ = lan("GET", "/api/videos", {"Cookie": cookie})
+        assert status == 200 and json.loads(body)[0]["id"] == "talk-1234abcd"
+        assert lan("GET", "/media/talk-1234abcd/video.mp4", {"Cookie": cookie, "Range": "bytes=0-9"})[0] == 206
+        assert lan("GET", "/api/videos", {"Cookie": cookie, "Origin": "https://evil.example"})[0] == 403
+        status, body, _ = lan("GET", "/api/phone", {"Cookie": cookie})
+        info = json.loads(body)
+        assert info["url"].endswith(key) and info["svg"].startswith("<svg")
+        # the computer itself still works without the key
+        assert call(port, "GET", "/api/videos")[0] == 200
+    finally:
+        httpd.shutdown()

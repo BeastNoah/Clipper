@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.24",
     "opencv-python-headless>=4.8,<5",  # 5.x drops the Haar fallback detector
     "pydantic>=2.0",
+    "qrcode>=7.4",
     "yt-dlp[default]>=2025.11.12",  # [default] includes the YouTube JS challenge solver
 ]
 

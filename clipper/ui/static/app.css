@@ -62,6 +62,16 @@ button, input, select, textarea { font: inherit; color: inherit; }
   margin-left: auto; display: flex; align-items: center; gap: 8px;
   font-size: 13px; color: var(--muted); cursor: pointer; background: none; border: 0;
 }
+.phone-btn { margin-left: 4px; }
+.jobs-pill[hidden] + .phone-btn { margin-left: auto; }
+.dialog { border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); color: var(--text);
+  padding: 22px; max-width: min(420px, calc(100vw - 32px)); box-shadow: 0 20px 60px rgba(0, 0, 0, .3); }
+.dialog::backdrop { background: rgba(0, 0, 0, .45); }
+.dialog form { margin-top: 16px; text-align: right; }
+.qr { background: #fff; border-radius: 12px; padding: 10px; width: 240px; margin: 6px auto 12px; }
+.qr svg { display: block; width: 100%; height: auto; }
+.link { font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; background: var(--panel-2); padding: 8px 10px; border-radius: 8px; }
+code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--panel-2); padding: 1px 5px; border-radius: 5px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.2s infinite; }
 @keyframes pulse { 50% { opacity: .35; } }
 

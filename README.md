@@ -35,7 +35,7 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
 
 ## The web interface
 
-`clipper ui` opens a page in your browser (it only listens on 127.0.0.1).
+`clipper ui` opens a page in your browser. By default only this computer can use it.
 
 - **Make clips:** paste a link or a file path, or drop a video file. Pick how many clips and how
   long; more settings are under "More settings".
@@ -48,6 +48,24 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   estimate and the log; they can be cancelled.
 - **Clips:** watch and download the finished clips and covers, and copy the post text for
   TikTok, Instagram or YouTube.
+
+### On your phone
+
+```bash
+clipper ui --phone
+```
+
+clipper then also answers other devices on your network and shows a QR code in the terminal
+(and under **Phone** in the interface). Scan it with the phone's camera while on the same Wi-Fi;
+after that, a home-screen bookmark is enough. On the phone you can paste links, upload videos
+from the camera roll, review, render and download the clips. The work still runs on the computer,
+so it has to stay on.
+
+The link contains an access key, kept in `work/.ui-key`; without it, other devices only get a
+"needs the access link" page. `clipper ui --phone --new-key` makes a new key and locks out old
+links. If the phone can't connect, allow incoming connections for Python when macOS asks (or in
+System Settings > Network > Firewall). Away from home, a VPN such as Tailscale gives the phone a
+way back to the computer; then use the computer's Tailscale address in the link.
 
 ## Command-line options
 

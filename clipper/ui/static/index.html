@@ -16,7 +16,13 @@
       <a href="#/" data-nav="home">Library</a>
     </nav>
     <div id="jobs-pill" class="jobs-pill" hidden></div>
+    <button id="phone-btn" class="btn ghost phone-btn" type="button">Phone</button>
   </header>
+  <dialog id="phone-dialog" class="dialog" aria-labelledby="phone-title">
+    <h2 id="phone-title">Open clipper on your phone</h2>
+    <div id="phone-body"></div>
+    <form method="dialog"><button class="btn">Close</button></form>
+  </dialog>
   <main id="app" tabindex="-1"></main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>

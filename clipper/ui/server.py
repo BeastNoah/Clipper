@@ -1,18 +1,25 @@
 """`clipper ui`: a local web interface for clipper.
 
-A small HTTP server (standard library only) on 127.0.0.1. It runs pipeline jobs one at a time in a
-worker thread and serves a single-page app from ./static.
+A small HTTP server (standard library only). By default it only answers this computer; with
+--phone it also serves other devices on the network that bring the access key. It runs pipeline
+jobs one at a time in a worker thread and serves a single-page app from ./static.
 """
 
 from __future__ import annotations
 
 import argparse
+import hmac
+import ipaddress
 import json
 import mimetypes
 import queue
+import os
 import re
+import secrets
 import shutil
+import socket
 import subprocess
+import sys
 import threading
 import time
 import traceback
@@ -33,6 +40,12 @@ from ..select import split_sentences
 from ..util import Cancelled, ClipperError, read_json, set_reporter
 
 STATIC = Path(__file__).with_name("static")
+COOKIE = "clipper_key"
+LOCKED_PAGE = """<!doctype html><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>clipper</title><body style="font:16px/1.5 system-ui,sans-serif;max-width:32em;margin:15vh auto;padding:0 20px">
+<h1>clipper</h1><p>This page needs the access link. On the computer running <code>clipper ui --phone</code>,
+scan the QR code shown in the terminal (or under <b>Phone</b> in clipper there), or type the link
+printed next to it.</p></body>"""
 VIDEO_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 MAX_LOG = 400
 
@@ -257,15 +270,29 @@ class Handler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass  # the browser stopped reading (normal when seeking a video)
 
-    def _trusted(self) -> bool:
-        """Only this page may use the API: the Host must be our own address (no DNS rebinding) and
-        a cross-site Origin is refused."""
-        port = self.server.server_address[1]
-        ok = {f"127.0.0.1:{port}", f"localhost:{port}"}
-        if self.headers.get("Host") not in ok:
-            return False
+    def _given_key(self) -> str:
+        key = parse_qs(urlparse(self.path).query).get("key")
+        if key:
+            return key[0]
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == COOKIE:
+                return value
+        return ""
+
+    def _authorized(self) -> bool:
+        """Requests from other websites are refused (Origin). This computer is trusted when it uses our
+        own host name (so DNS rebinding can't get in); anything else needs the --phone access key."""
+        host = self.headers.get("Host") or ""
         origin = self.headers.get("Origin")
-        return origin is None or origin.removeprefix("http://") in ok
+        if origin is not None and origin != f"http://{host}":
+            return False
+        port = self.server.server_address[1]
+        loopback = ipaddress.ip_address(self.client_address[0]).is_loopback
+        if loopback and host in (f"127.0.0.1:{port}", f"localhost:{port}"):
+            return True
+        key = self.app.key
+        return key is not None and hmac.compare_digest(self._given_key().encode(), key.encode())
 
     def handle_one_request(self):
         try:
@@ -276,8 +303,16 @@ class Handler(BaseHTTPRequestHandler):
     def parse_request(self) -> bool:
         if not super().parse_request():
             return False
-        if not self._trusted():
-            self._error(403, "requests must come from the clipper page itself")
+        if not self._authorized():
+            if urlparse(self.path).path == "/" and self.command == "GET":
+                body = LOCKED_PAGE.encode()
+                self.send_response(403)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self._error(403, "requests must come from the clipper page itself")
             return False
         return True
 
@@ -290,6 +325,14 @@ class Handler(BaseHTTPRequestHandler):
         parts = [unquote(p) for p in url.path.strip("/").split("/") if p]
         qs = parse_qs(url.query)
         if not parts:
+            if "key" in qs:  # first visit from the phone link: remember the key, then drop it from the URL
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.send_header("Set-Cookie", f"{COOKIE}={qs['key'][0]}; Path=/; Max-Age=31536000; "
+                                               "HttpOnly; SameSite=Lax")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             return self._file(STATIC / "index.html")
         if parts[0] == "static" and len(parts) == 2 and re.match(r"^[\w.-]+$", parts[1]):
             return self._file(STATIC / parts[1])
@@ -305,6 +348,9 @@ class Handler(BaseHTTPRequestHandler):
         route = parts[1:]
         if route == ["choices"]:
             return self._json(choices())
+        if route == ["phone"]:
+            url = self.app.phone_url
+            return self._json({"url": url, "svg": qr_svg(url) if url else None})
         if route == ["videos"]:
             vids = [v for w in sorted(self.app.root.iterdir()) if w.is_dir() and VIDEO_ID.match(w.name)
                     for v in [video_summary(w)] if v]
@@ -372,9 +418,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class App:
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, key: str | None = None, phone_url: str | None = None):
         self.root = root
         self.jobs = JobManager()
+        self.key, self.phone_url = key, phone_url
 
     def make_job(self, body: dict) -> Job:
         opts = Options.from_dict({**body.get("options", {}), "work_dir": str(self.root)})
@@ -408,29 +455,91 @@ class App:
         raise ValueError("kind must be 'process' or 'render'")
 
 
+def lan_ip() -> str | None:
+    """This computer's address on the local network (no packets are sent)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        try:
+            sock.connect(("10.255.255.255", 1))
+            ip = sock.getsockname()[0]
+        except OSError:
+            return None
+    return None if ipaddress.ip_address(ip).is_loopback else ip
+
+
+def phone_key(root: Path, renew: bool = False) -> str:
+    """The access key for other devices, kept in the work folder so phone links survive restarts."""
+    path = root / ".ui-key"
+    if path.exists() and not renew:
+        return path.read_text().strip()
+    key = secrets.token_urlsafe(18)
+    path.write_text(key)
+    os.chmod(path, 0o600)
+    return key
+
+
+def qr_svg(text: str) -> str | None:
+    try:
+        import qrcode
+        import qrcode.image.svg
+    except ImportError:
+        return None
+    return qrcode.make(text, image_factory=qrcode.image.svg.SvgPathImage, border=2).to_string(encoding="unicode")
+
+
+def print_qr(text: str) -> None:
+    try:
+        import qrcode
+    except ImportError:
+        return
+    qr = qrcode.QRCode(border=2)
+    qr.add_data(text)
+    qr.make()
+    qr.print_ascii(tty=sys.stdout.isatty())
+
+
 def serve(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="clipper ui")
     p.add_argument("--port", type=int, default=8765)
     p.add_argument("--work-dir", default="work", help="where results are kept (default ./work)")
     p.add_argument("--no-browser", action="store_true", help="don't open a browser window")
+    p.add_argument("--phone", action="store_true",
+                   help="also open it to phones and other devices on your network (they need the link with "
+                        "the access key, shown as a QR code)")
+    p.add_argument("--new-key", action="store_true",
+                   help="with --phone: make a new access key, so old phone links stop working")
     args = p.parse_args(argv)
     for tool in ("ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             raise ClipperError(f"'{tool}' was not found on PATH. Run `clipper doctor` for help.")
     root = Path(args.work_dir).resolve()
     root.mkdir(parents=True, exist_ok=True)
-    handler = type("BoundHandler", (Handler,), {"app": App(root)})
+    app = App(root)
+    handler = type("BoundHandler", (Handler,), {"app": app})
     server = None
     for port in range(args.port, args.port + 20):
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", port), handler)
+            server = ThreadingHTTPServer(("0.0.0.0" if args.phone else "127.0.0.1", port), handler)
             break
         except OSError:
             continue
     if server is None:
         raise ClipperError(f"No free port between {args.port} and {args.port + 19}")
-    url = f"http://127.0.0.1:{server.server_address[1]}/"
+    port = server.server_address[1]
+    url = f"http://127.0.0.1:{port}/"
     print(f"clipper ui running at {url}  (work folder: {root})  Press Ctrl+C to stop.")
+    if args.phone:
+        app.key = phone_key(root, args.new_key)
+        ip = lan_ip()
+        if ip:
+            app.phone_url = f"http://{ip}:{port}/?key={app.key}"
+            print("\nOn your phone (same Wi-Fi), scan this or open the link:\n")
+            print_qr(app.phone_url)
+            print(f"  {app.phone_url}\n")
+            print("Anyone with this link can use clipper on this computer, so keep it to yourself.\n"
+                  "To lock out old links: clipper ui --phone --new-key. If the phone can't connect, allow\n"
+                  "incoming connections for Python when macOS asks (System Settings > Network > Firewall).")
+        else:
+            print("Couldn't find this computer's network address; is it connected to Wi-Fi?")
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
