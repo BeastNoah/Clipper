@@ -81,8 +81,13 @@ def _faster_whisper(audio, model_name: str, language: str | None, vad: bool, tot
         raise ClipperError("faster-whisper is not installed: pip install faster-whisper") from e
     if model_name not in _fw_models:
         log(f"{label}: loading whisper model '{model_name}' (downloaded once on first use)")
-        _fw_models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8",
-                                              cpu_threads=os.cpu_count() or 4)
+        try:
+            _fw_models[model_name] = WhisperModel(model_name, device="cpu", compute_type="int8",
+                                                  cpu_threads=os.cpu_count() or 4)
+        except Exception as e:  # noqa: BLE001 - download and load errors come in many types
+            raise ClipperError(f"Couldn't load the whisper model '{model_name}' ({type(e).__name__}: {e}). "
+                               "It is downloaded from huggingface.co on first use, so check the internet "
+                               "connection, or choose another model.") from e
     model = _fw_models[model_name]
     segments, info = model.transcribe(
         audio if isinstance(audio, np.ndarray) else str(audio),

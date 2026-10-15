@@ -163,6 +163,7 @@ def process(source: str, opts: Options) -> tuple[Path, list[dict]]:
     work_root = Path(opts.work_dir)
     report("step", "ingest")
     work, meta = ingest(source, work_root, force=opts.forced("ingest"))
+    report("video", work.name)
     if opts.stop_after == "ingest":
         return work, []
     report("step", "transcribe")
@@ -203,5 +204,6 @@ def produce_reviewed(work: Path, items: list[dict], opts: Options) -> list[dict]
     clips = clips_from_review(transcript, meta, candidates, items)
     if not clips:
         raise ClipperError("No clips were selected.")
-    write_json(work / "review.json", {"items": items, "options": opts.to_dict()})
+    sig = ",".join(f"{c['id']}:{c['si']}-{c['ei']}" for c in candidates)  # same format as the UI's
+    write_json(work / "review.json", {"items": items, "candidates": sig, "options": opts.to_dict()})
     return produce(work, meta, transcript, clips, opts)
