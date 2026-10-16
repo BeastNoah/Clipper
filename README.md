@@ -49,6 +49,11 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   the player (for YouTube links that's YouTube's own player, since only the sound has been
   downloaded at that point), tick the ones you want, rename them, and move the start or end by a sentence.
   Click two sentences in the transcript to add a clip of your own.
+- **Find new clips:** on a video's page, ask Claude for more clips at any time, without downloading
+  or transcribing again. Optionally say what to look for, how many and how long, and which part of
+  the video. Claude only looks at moments it hasn't suggested yet; earlier suggestions and finished
+  clips stay. New suggestions are marked "new" and ticked, or tick "Render them right away" to have
+  them made and added to the clips you already have.
 - **Render:** renders the ticked clips. Jobs run one at a time and show progress, a time
   estimate and the log; they can be cancelled.
 - **Clips:** watch and download the finished clips (switch between formats), covers and caption
@@ -82,6 +87,7 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--model` | `opus` | Claude model that picks the clips (`opus`, `sonnet`, `haiku` or a full name) |
 | `--prompt TEXT` | | what Claude should look for, e.g. `"funny moments"` or `"everything about pricing"` |
 | `--from` / `--to` | | only use part of the video, e.g. `--from 10:00 --to 45:00` |
+| `--new-clips` | | for a video clipper has seen before: ask for clips at moments Claude hasn't suggested yet, and make them alongside the clips already made |
 | `--whisper-model` | `small` | model for the full transcript |
 | `--caption-model` | `turbo` | bigger model that re-transcribes only the chosen clips, for accurate captions; `none` reuses the transcript |
 | `--whisper-backend` | `auto` | `mlx` (Apple Silicon GPU) when installed, else `faster-whisper` (CPU) |
@@ -145,6 +151,9 @@ model runs at about 7–10x real time there, so a 20-minute video takes 2–3 mi
   clip then runs too long, Claude chooses which sentences to keep (so the punchline survives);
   if it's too short, code adds the next sentence. Where clips overlap or repeat each other, the
   higher-scoring one wins. If too few survive, Claude is asked for more.
+- Asking for new clips later (`--new-clips`, or **Find new clips** in the web interface) starts a
+  new search that tells Claude which moments were already suggested or made, so it looks elsewhere.
+  Every suggestion is kept in `select.json`.
 - Requests go through the `claude` command-line tool, so they use your subscription. Each answer
   must match a fixed JSON format; if it doesn't, the validation error goes back to Claude in the
   same conversation and it tries again.
@@ -187,7 +196,7 @@ work/<video_id>/
   thumb.jpg            the video's thumbnail (links)
   audio.wav            16 kHz mono audio
   transcript.json      every word with its start and end time
-  select.json          Claude's proposals, trims, scores and re-scores
+  select.json          Claude's proposals, trims, scores and re-scores (earlier searches too)
   clips.json           Claude's picks
   review.json          your picks from the web interface
   posts.json           post text per clip

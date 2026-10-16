@@ -211,7 +211,10 @@ details[open] > summary::before { content: "▾ "; }
 .caption-line { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: start; }
 .caption-line .t { color: var(--muted); font-size: 12px; padding-top: 9px; font-variant-numeric: tabular-nums; }
 .caption-line textarea { width: 100%; resize: vertical; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 14px; }
-#focus { font-size: 15px; }
+#focus, .find-focus { font-size: 15px; }
+.find { display: grid; gap: 12px; margin-bottom: 12px; }
+.find h2 { margin: 0 0 2px; }
+.chip.new { background: var(--accent); color: var(--accent-text); font-weight: 650; }
 .post { margin-top: 10px; }
 .post-tabs { display: flex; gap: 4px; margin-bottom: 6px; }
 .post-tabs button { border: 0; background: none; font-size: 12px; font-weight: 650; color: var(--muted); padding: 4px 8px; border-radius: 7px; cursor: pointer; }

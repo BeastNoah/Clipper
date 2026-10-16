@@ -6,7 +6,7 @@ import pytest
 from clipper.llm import Claude, InvalidReply
 from clipper.select import (
     CHUNK_SECONDS, Timeline, clips_from_review, make_chunks, parse_proposals, parse_rescores,
-    resolve_overlaps, select_clips, snap_and_fit, split_sentences,
+    merged_length, resolve_overlaps, saved_candidates, select_clips, snap_and_fit, split_sentences,
 )
 from clipper.util import ClipperError
 from conftest import make_words
@@ -139,6 +139,42 @@ def test_parts_of_a_long_video_are_asked_about_at_the_same_time(tmp_path, fake_c
     starts = [c["t"] for c in _calls(fake_claude) if "<transcript>" in c["prompt"]]
     assert len(starts) == 3
     assert max(starts) - min(starts) < 0.9  # one by one, each would start after the one before had answered
+
+
+def test_new_search_keeps_and_steers_clear_of_earlier_suggestions(tmp_path, fake_claude):
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(120)])  # ~7 min
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    kw = dict(min_len=20, max_len=40, model="test", claude_factory=lambda: Claude("test"))
+    select_clips(tmp_path, meta, {"words": words}, num_clips=2, **kw)
+    earlier = json.loads((tmp_path / "select.json").read_text())["candidates"]
+    made = [(300.0, 330.0)]  # a clip made by hand
+    new = select_clips(tmp_path, meta, {"words": words}, num_clips=2, new_search=True, also_avoid=made, **kw)
+    state = json.loads((tmp_path / "select.json").read_text())
+    assert state["search"] == 2 and state["earlier"] == earlier and len(new) == 2
+    ids = [c["id"] for c in saved_candidates(tmp_path)]
+    assert len(ids) == len(set(ids)) == len(earlier) + len(state["candidates"])
+    taken = [(c["start"], c["end"]) for c in earlier] + made
+    for c in new:
+        assert c["id"] not in {e["id"] for e in earlier}
+        assert merged_length(taken, c["start"], c["end"]) <= 0.25 * c["duration"]
+    prompt = [c for c in _calls(fake_claude) if "<transcript>" in c["prompt"]][-1]["prompt"]
+    assert "already taken" in prompt and "- 300.0-330.0" in prompt
+
+    # the same options again reuse the newest search without asking Claude
+    n = len(_calls(fake_claude))
+    again = select_clips(tmp_path, meta, {"words": words}, num_clips=2, **kw)
+    assert [c["id"] for c in again] == [c["id"] for c in new] and len(_calls(fake_claude)) == n
+    # other options start another search, and everything suggested before stays listed
+    select_clips(tmp_path, meta, {"words": words}, num_clips=2, **{**kw, "max_len": 35})
+    assert len(saved_candidates(tmp_path)) > len(ids)
+    # --force select starts over
+    select_clips(tmp_path, meta, {"words": words}, num_clips=2, force=True, **kw)
+    assert {c.get("search") for c in saved_candidates(tmp_path)} == {1}
+
+
+def test_merged_length_counts_overlaps_once():
+    assert merged_length([(0, 10), (5, 15), (20, 30)], 0, 25) == 20
+    assert merged_length([(0, 10)], 20, 30) == 0
 
 
 def test_asks_for_more_when_too_few_survive(tmp_path, fake_claude, monkeypatch):

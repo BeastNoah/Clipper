@@ -37,6 +37,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--model", default=d.model, help="Claude model that picks the clips (default opus)")
     g.add_argument("--prompt", default=None, metavar="TEXT",
                    help="what Claude should look for, e.g. 'funny moments' or 'everything about pricing'")
+    g.add_argument("--new-clips", action="store_true",
+                   help="ask for clips at moments Claude hasn't suggested before; they're made alongside the "
+                        "clips already made (for a video that's been through clipper before)")
     g.add_argument("--from", dest="range_start", default=None, metavar="TIME",
                    help="only use the video from this time on (seconds, 12:30 or 1:02:03)")
     g.add_argument("--to", dest="range_end", default=None, metavar="TIME", help="only use the video up to this time")
@@ -122,7 +125,7 @@ def run_sources(args: argparse.Namespace) -> int:
         if len(sources) > 1:
             log(f"=== video {n} of {len(sources)}: {source}")
         try:
-            work, clips = process(source, opts)
+            work, clips = process(source, opts, new_clips=args.new_clips)
         except ClipperError as e:
             if len(sources) == 1:
                 raise

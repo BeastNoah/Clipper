@@ -130,3 +130,34 @@ def test_whole_file_conversion_on_request(tmp_path, fake_claude):
     assert cli.main(args) == 0
     assert len(list((work / "output").glob("*.mp4"))) == 1
     assert not list((work / "clips").glob("*/section.mp4"))
+
+
+def test_new_clips_for_a_video_done_before(tmp_path, fake_claude):
+    src = tmp_path / "talk.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=75",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=75", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    root = tmp_path / "work"
+    args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "6", "--max-len", "10",
+            "--preset", "ultrafast", "--caption-model", "none", "--no-posts"]
+    assert cli.main([*args, "--stop-after", "ingest"]) == 0
+    (work,) = root.iterdir()
+    meta = json.loads((work / "meta.json").read_text())
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "en", "words": make_words(
+            [f"This is spoken sentence number {i} today." for i in range(22)], start=0.5)},
+    })
+    assert cli.main(args) == 0
+    (first,) = json.loads((work / "output" / "clips.json").read_text())
+    first_mp4 = work / "output" / first["file"]
+    mtime = first_mp4.stat().st_mtime_ns
+
+    assert cli.main([*args, "--new-clips"]) == 0
+    clips = json.loads((work / "output" / "clips.json").read_text())
+    assert [c["id"] for c in clips][0] == first["id"] and len(clips) == 2
+    new = clips[1]
+    assert new["start"] >= first["end"] or new["end"] <= first["start"]
+    assert first_mp4.stat().st_mtime_ns == mtime  # the clip made before isn't made again
+    assert len(list((work / "output").glob("*.mp4"))) == 2

@@ -36,7 +36,8 @@ from ..edit import MODES as JUMP_CUT_MODES
 from ..formats import SIZES
 from ..ingest import local_source
 from ..pipeline import (
-    Options, caption_lines, edited_words, load_video, process, produce_reviewed, rerender, save_caption_lines,
+    Options, caption_lines, edited_words, find_new_clips, load_video, process, produce_reviewed, rerender,
+    save_caption_lines,
 )
 from ..reframe import LAYOUTS
 from ..render import ENCODERS
@@ -59,7 +60,7 @@ MAX_LOG = 400
 
 @dataclass
 class Job:
-    kind: str                       # "process" or "render"
+    kind: str                       # "process", "suggest" (new suggestions to review) or "render"
     label: str
     run: object                     # callable doing the work
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
@@ -505,7 +506,21 @@ class App:
                 rerender(work, opts)
             title = read_json(work / "meta.json").get("title") or vid
             return self.jobs.submit(Job("render", f"Update clips: {title}", run, video=vid))
-        raise ValueError("kind must be 'process', 'render' or 'rerender'")
+        if kind == "new_clips":
+            vid = str(body.get("video") or "")
+            work = self.root / vid
+            if not VIDEO_ID.match(vid) or not (work / "transcript.json").exists():
+                raise ValueError("this video hasn't been transcribed yet")
+            render = bool(body.get("render"))
+            opts.stop_after = None
+
+            def run(job: Job) -> None:
+                job.video = vid
+                find_new_clips(work, opts, render=render)
+            title = read_json(work / "meta.json").get("title") or vid
+            what = f"{opts.num_clips} new clip(s)" + (f" ({opts.prompt})" if opts.prompt else "")
+            return self.jobs.submit(Job("render" if render else "suggest", f"{what}: {title}", run, video=vid))
+        raise ValueError("kind must be 'process', 'render', 'rerender' or 'new_clips'")
 
     def rendered_clip(self, work: Path, rank: str) -> dict | None:
         path = work / "output" / "clips.json"

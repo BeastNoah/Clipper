@@ -19,7 +19,7 @@ from .llm import Claude
 from .posts import format_post, write_posts
 from .reframe import LAYOUTS, reframe
 from .render import ENCODERS, LOGO_POSITIONS, Look, check_ffmpeg_has_libass, render
-from .select import clips_from_review, select_clips
+from .select import clips_from_review, saved_candidates, select_clips
 from .transcribe import clip_words, transcribe
 from .translate import spread, translate_clip
 from .util import (
@@ -294,8 +294,9 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
     return clips
 
 
-def process(source: str, opts: Options) -> tuple[Path, list[dict]]:
-    """Run one video through the pipeline (or up to opts.stop_after)."""
+def process(source: str, opts: Options, new_clips: bool = False) -> tuple[Path, list[dict]]:
+    """Run one video through the pipeline (or up to opts.stop_after). new_clips: once transcribed, ask Claude
+    for clips at moments it hasn't suggested before, and make them alongside the clips already made."""
     for tool in ("ffmpeg", "ffprobe"):
         require_tool(tool)
     work_root = Path(opts.work_dir)
@@ -311,6 +312,8 @@ def process(source: str, opts: Options) -> tuple[Path, list[dict]]:
     if opts.stop_after == "transcribe":
         return work, []
     check_cancel()
+    if new_clips:
+        return work, find_new_clips(work, opts, render=opts.stop_after != "select")
     report("step", "select")
     clips = select_clips(work, meta, transcript, num_clips=opts.num_clips, min_len=opts.min_len,
                          max_len=opts.max_len, model=opts.model, claude_factory=claude_factory(opts, work),
@@ -331,8 +334,7 @@ def load_video(work: Path) -> dict:
         path = work / f"{name}.json"
         out[name] = read_json(path) if path.exists() else None
     out["transcribed"] = (work / "transcript.json").exists()
-    sel = work / "select.json"
-    out["candidates"] = read_json(sel)["candidates"] if sel.exists() else []
+    out["candidates"] = saved_candidates(work)
     rendered = work / "output" / "clips.json"
     out["rendered"] = read_json(rendered) if rendered.exists() else []
     return out
@@ -342,13 +344,40 @@ def produce_reviewed(work: Path, items: list[dict], opts: Options) -> list[dict]
     """Render clips chosen (and possibly adjusted) by hand in the review screen."""
     meta = read_json(work / "meta.json")
     transcript = read_json(work / "transcript.json")["result"]
-    candidates = read_json(work / "select.json")["candidates"] if (work / "select.json").exists() else []
+    candidates = saved_candidates(work)
+    rendered = work / "output" / "clips.json"
+    if rendered.exists():  # clips made earlier keep their keywords even if their suggestion is gone
+        known = {c["id"] for c in candidates}
+        candidates += [c for c in read_json(rendered) if c.get("id") not in known]
     clips = clips_from_review(transcript, meta, candidates, items)
     if not clips:
         raise ClipperError("No clips were selected.")
     sig = ",".join(f"{c['id']}:{c['si']}-{c['ei']}" for c in candidates)  # same format as the UI's
     write_json(work / "review.json", {"items": items, "candidates": sig, "options": opts.to_dict()})
     return produce(work, meta, transcript, clips, opts)
+
+
+def find_new_clips(work: Path, opts: Options, render: bool = False) -> list[dict]:
+    """Ask Claude for clips at moments it hasn't suggested yet (for a video that's already transcribed).
+    The earlier suggestions stay. With render, the new clips are made and added to the ones already made."""
+    meta = read_json(work / "meta.json")
+    if not (work / "transcript.json").exists():
+        raise ClipperError("This video hasn't been transcribed yet.")
+    transcript = read_json(work / "transcript.json")["result"]
+    path = work / "output" / "clips.json"
+    made = [c for c in read_json(path) if c.get("file")] if path.exists() else []
+    report("step", "select")
+    new = select_clips(work, meta, transcript, num_clips=opts.num_clips, min_len=opts.min_len,
+                       max_len=opts.max_len, model=opts.model, claude_factory=claude_factory(opts, work),
+                       focus=opts.prompt, time_range=(opts.range_start, opts.range_end), new_search=True,
+                       also_avoid=[(c["start"], c["end"]) for c in made])
+    if not new:
+        raise ClipperError("Claude didn't find any new clips. Try other lengths, another part of the video, "
+                           "or tell it what to look for.")
+    if not render:
+        return new
+    items = [{"id": c.get("id"), "si": c["si"], "ei": c["ei"], "title": c["title"]} for c in made + new]
+    return produce_reviewed(work, items, opts)
 
 
 def rerender(work: Path, opts: Options) -> list[dict]:

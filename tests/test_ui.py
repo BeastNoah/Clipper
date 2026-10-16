@@ -130,6 +130,20 @@ def test_ui_api(server):
     assert "Spoken-Word" not in next(work.glob("clips/*/9x16/captions.ass")).read_text()
     assert call(port, "GET", f"/api/videos/{vid}/captions/9")[0] == 404
 
+    # ask Claude for a new clip of this already transcribed video, made next to the one made by hand
+    status, job, _ = call(port, "POST", "/api/jobs", {"kind": "new_clips", "video": vid, "render": True, "options": {
+        "num_clips": 1, "min_len": 4, "max_len": 8, "prompt": "jokes", "caption_model": "none", "preset": "ultrafast"}})
+    assert status == 201 and job["kind"] == "render" and job["video"] == vid
+    job = wait(port, job["id"])
+    assert job["state"] == "done", job
+    detail = call(port, "GET", f"/api/videos/{vid}")[1]
+    (cand,) = detail["candidates"]
+    assert cand["focus"] == "jokes" and cand["search"] == 1
+    assert [c["title"] for c in detail["rendered"]][0] == "Hand picked"
+    assert [c["id"] for c in detail["rendered"]] == ["u1-3", cand["id"]]
+    assert all(c["file"] for c in detail["rendered"])
+    assert call(port, "POST", "/api/jobs", {"kind": "new_clips", "video": "nope-12345678"})[0] == 400
+
 
 def wait(port, job_id):
     for _ in range(240):

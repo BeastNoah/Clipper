@@ -111,7 +111,7 @@ async function pollJobs() {
       renderVideoJob();
       if (finished.some(j => j.video === S.route.id)) {
         const job = finished.find(j => j.video === S.route.id);
-        if (job.state === "done") toast(job.kind === "render" ? "Clips are ready" : "Clips are ready to review");
+        if (job.state === "done") toast(job.kind === "render" ? "Clips are ready" : job.kind === "suggest" ? "New suggestions are ready" : "Clips are ready to review");
         await loadVideo(S.route.id, job.kind === "render" ? "clips" : "review");
       }
     }
@@ -325,13 +325,18 @@ function candidatesSig(cands) {
 function initReview(v) {
   const sentences = v.sentences;
   const sig = candidatesSig(v.candidates);
-  const cands = [...v.candidates].sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  // "Find new clips" only adds suggestions, so a review made on an earlier list still applies as long as
+  // every suggestion it saw is still there unchanged.
+  const current = new Set(sig.split(",").filter(Boolean));
+  const covers = old => old != null && old.split(",").filter(Boolean).every(x => current.has(x));
+  const latest = Math.max(1, ...v.candidates.map(c => c.search || 1));
+  const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || (b.score ?? 0) - (a.score ?? 0));
   const picked = new Set((v.clips || []).map(c => c.id));
   const items = {};
   for (const c of cands) items[c.id] = { key: c.id, id: c.id, si: c.si, ei: c.ei, title: c.title, selected: picked.has(c.id), cand: c };
   // Edits only make sense for the suggestions they were made on.
   const saved = store.get(reviewKey(v.id), null);
-  const fromServer = v.review?.candidates === sig ? v.review.items : null;
+  const fromServer = covers(v.review?.candidates) ? v.review.items : null;
   const apply = list => {
     for (const k of Object.keys(items)) items[k].selected = false;
     for (const it of list) {
@@ -340,10 +345,15 @@ function initReview(v) {
       Object.assign(items[key], { si: it.si, ei: it.ei, title: it.title ?? items[key].title, selected: it.selected ?? true });
     }
   };
-  if (saved && saved.items && saved.sig === sig) apply(saved.items);
-  else if (fromServer) apply(fromServer);
+  let seen = null;
+  if (saved && saved.items && covers(saved.sig)) { apply(saved.items); seen = saved.sig; }
+  else if (fromServer) { apply(fromServer); seen = v.review.candidates; }
+  if (seen != null) {  // Claude's picks from a search made after that review start ticked
+    const before = new Set(seen.split(",").filter(Boolean).map(x => x.split(":")[0]));
+    for (const id of picked) if (items[id] && !before.has(id)) items[id].selected = true;
+  }
   const order = [...cands.map(c => c.id), ...Object.keys(items).filter(k => !items[k].cand)];
-  return { items, order, sig, mark: null, markEnd: null, focus: null };
+  return { items, order, sig, latest, mark: null, markEnd: null, focus: null };
 }
 
 function persistReview() {
@@ -363,6 +373,7 @@ async function loadVideo(id, tab) {
     S.video = v;
     S.video.version = Date.now();
     S.review = v.sentences.length ? initReview(v) : null;
+    if (S.review) persistReview();  // so the ticks survive when "Find new clips" adds suggestions
     if (tab) S.tab = tab;
     else if (!S.tab) S.tab = v.rendered?.some(c => c.file) ? "clips" : "review";
     renderVideo();
@@ -409,9 +420,49 @@ function reviewView() {
       h("div", { class: "custom-bar", id: "custom-bar", style: "padding:0 8px" })));
 
   const list = h("div", { class: "cands", id: "cands" });
-  const wrap = h("div", { class: "review" }, side, h("div", { class: "cands-col" }, list));
+  const wrap = h("div", { class: "review" }, side, h("div", { class: "cands-col" }, findPanel(), list));
   setTimeout(() => { renderCands(); renderTranscript(); renderCustomBar(); renderRenderBar(); }, 0);
   return h("div", {}, wrap, h("div", { class: "renderbar", id: "renderbar" }));
+}
+
+// Ask Claude for (more) clips of a video that's already transcribed. Earlier suggestions and finished clips stay.
+function findPanel() {
+  const v = S.video, has = v.candidates.length > 0;
+  const running = S.jobs.some(j => j.video === v.id && (j.state === "running" || j.state === "queued"));
+  S.findFocus = S.findFocus || {};
+  const focus = h("input", { type: "text", class: "find-focus", autocomplete: "off", value: S.findFocus[v.id] || "",
+    placeholder: "Optional: what should Claude look for? e.g. funny moments", oninput: e => { S.findFocus[v.id] = e.target.value; } });
+  const render = h("input", { type: "checkbox", checked: store.get("clipper.findRender", false) });
+  const button = h("button", { class: "btn primary", disabled: running, onclick: () => go() },
+    running ? "Working…" : has ? "Find new clips" : "Find clips");
+  const go = async () => {
+    if (button.disabled) return;
+    button.disabled = true;
+    button.textContent = "Working…";
+    store.set("clipper.findRender", render.checked);
+    try {
+      await api.post("/api/jobs", { kind: "new_clips", video: v.id, render: render.checked,
+        options: { ...options(), prompt: focus.value.trim() || null } });
+      toast(render.checked ? "Finding and rendering new clips" : "Asking Claude for new clips");
+      pollJobs();
+    } catch (e) {
+      toast(e.message);
+      button.disabled = false;
+      button.textContent = has ? "Find new clips" : "Find clips";
+    }
+  };
+  focus.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+  return h("div", { class: "panel find" },
+    h("div", {}, h("h2", {}, has ? "Find new clips" : "Find clips"),
+      h("div", { class: "small muted" }, has
+        ? "Claude looks for moments it hasn't suggested yet. The suggestions below and your finished clips stay."
+        : "Claude reads the transcript and suggests the best moments.")),
+    focus,
+    h("div", { class: "quick" }, ...settingsFields(options(), ["num_clips", "min_len", "max_len"])),
+    h("details", {}, h("summary", {}, "More"),
+      h("div", { class: "settings" }, ...settingsFields(options(), ["range_start", "range_end", "model"]))),
+    h("div", { class: "row" },
+      h("label", { class: "check grow" }, render, "Render them right away"), button));
 }
 
 // Without a downloaded video (only the clip sections get fetched), YouTube's own player previews the
@@ -483,6 +534,8 @@ function candView(it, n) {
       subs,
       c?.hook ? h("div", { class: "hook" }, `“${c.hook}”`) : null,
       h("div", { class: "chips" },
+        c && S.review.latest > 1 && (c.search || 1) === S.review.latest ? h("span", { class: "chip new" }, "new") : null,
+        c?.focus ? h("span", { class: "chip", title: "What Claude was asked to look for" }, `for: ${c.focus}`) : null,
         ...(c?.keywords || []).map(k => h("span", { class: "chip key", title: "Highlighted in the captions" }, k)),
         c?.duplicate_of ? h("span", { class: "chip warn" }, `Similar to a better clip (${c.duplicate_of})`) : null,
         c?.trimmed_by_claude ? h("span", { class: "chip", title: "Claude chose which sentences to keep" }, "shortened by Claude") : null),
@@ -505,7 +558,7 @@ function renderCands() {
   if (!box) return;
   const r = S.review;
   if (!r.order.length) {
-    box.replaceChildren(h("div", { class: "panel empty" }, "No clip suggestions yet. Make your own from the transcript."));
+    box.replaceChildren(h("div", { class: "panel empty" }, "No clip suggestions yet. Ask Claude above, or make your own from the transcript."));
     return;
   }
   let n = 0;

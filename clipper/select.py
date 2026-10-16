@@ -308,6 +308,17 @@ def snap_and_fit(tl: Timeline, start: float, end: float, min_len: float, max_len
     return fit(tl, *snap(tl, start, end), min_len, max_len)
 
 
+def merged_length(spans: list[tuple[float, float]], lo: float, hi: float) -> float:
+    """Seconds of [lo, hi] covered by the spans (overlapping spans counted once)."""
+    total, reach = 0.0, lo
+    for s, e in sorted(spans):
+        s, e = max(s, reach), min(e, hi)
+        if e > s:
+            total += e - s
+            reach = e
+    return total
+
+
 def resolve_overlaps(cands: list[dict]) -> list[dict]:
     """Where clips overlap, or Claude marked two as telling the same story, keep the higher-scoring one."""
     kept: list[dict] = []
@@ -458,7 +469,10 @@ Reply with only a JSON object with one entry per clip, in exactly this format:
 class Selector:
     def __init__(self, work: Path, meta: dict, transcript: dict, *, min_len: float, max_len: float,
                  model: str, claude_factory: Callable[[], Claude], force: bool = False,
-                 focus: str | None = None, time_range: tuple[float | None, float | None] = (None, None)):
+                 focus: str | None = None, time_range: tuple[float | None, float | None] = (None, None),
+                 new_search: bool = False, also_avoid: list[tuple[float, float]] = ()):
+        """new_search: ask for clips at moments not suggested yet (nor in also_avoid), even if these
+        options were used before."""
         words = transcript["words"]
         self.sentences = split_sentences(words)
         if not self.sentences:
@@ -480,9 +494,22 @@ class Selector:
         params = {"version": SELECT_VERSION, "transcript": fingerprint(words), "min_len": min_len,
                   "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks],
                   "focus": self.focus}
-        state = read_json(self.path) if self.path.exists() and not force else None
-        if not state or state.get("params") != params:
-            state = {"params": params, "done": [], "candidates": [], "rescored": {}}
+        old = read_json(self.path) if self.path.exists() and not force else None
+        if old and {k: old["params"].get(k) for k in ("version", "transcript")} != \
+                {k: params[k] for k in ("version", "transcript")}:
+            old = None  # suggestions for another transcript don't line up with this one's sentences
+        if old and old["params"] == params and not new_search:
+            state = old
+        else:
+            # A new search: what was suggested before stays (for the review screen); when asked for new clips,
+            # Claude also steers clear of it.
+            earlier = (old.get("earlier", []) + old["candidates"]) if old else []
+            state = {"params": params, "done": [], "candidates": [], "rescored": {},
+                     "search": old.get("search", 1) + 1 if old else 1, "earlier": earlier,
+                     "avoid": [list(x) for x in sorted({(c["start"], c["end"]) for c in earlier}
+                                                       | {tuple(x) for x in also_avoid})] if new_search else []}
+        for key, default in (("search", 1), ("earlier", []), ("avoid", [])):
+            state.setdefault(key, default)
         self.state = state
 
     @property
@@ -514,8 +541,10 @@ class Selector:
         text = self.tl.text(si, ei)
         cands = self.state["candidates"]
         cands.append({
-            "id": f"c{len(cands) + 1}",
+            "id": f"c{len(self.state['earlier']) + len(cands) + 1}",  # unique across searches
             "call": call,
+            "search": self.state["search"],
+            "focus": self.focus,
             "title": proposal["title"].strip().strip('"'),
             "hook": proposal["hook"].strip(),
             "scores": proposal["scores"],
@@ -563,14 +592,13 @@ class Selector:
             if call in self.state["done"]:
                 continue
             lo, hi = self._chunk_bounds(k)
-            avoid = []
+            avoid = [(s, e) for s, e in self.state["avoid"]]
             if with_avoid:
-                avoid = sorted((c["start"], c["end"]) for c in self.state["candidates"]
-                               if c["start"] < hi and c["end"] > lo)
-                taken = sum(min(e, hi) - max(s, lo) for s, e in avoid)
-                if hi - lo - taken < self.min_len:
-                    self.state["done"].append(call)
-                    continue
+                avoid += [(c["start"], c["end"]) for c in self.state["candidates"]]
+            avoid = sorted((s, e) for s, e in avoid if s < hi and e > lo)
+            if avoid and hi - lo - merged_length(avoid, lo, hi) < self.min_len:
+                self.state["done"].append(call)
+                continue
             jobs.append((k, call, count_for_chunk(k), avoid))
         if not jobs:
             return
@@ -621,7 +649,11 @@ class Selector:
 
     def _survivors(self) -> list[dict]:
         self._rescore()
-        return resolve_overlaps(self.state["candidates"])
+        avoid = self.state["avoid"]
+        # Claude was asked to stay clear of earlier suggestions; aligning to sentences can still overlap a little.
+        fresh = [c for c in self.state["candidates"]
+                 if merged_length(avoid, c["start"], c["end"]) <= 0.25 * (c["end"] - c["start"])]
+        return resolve_overlaps(fresh)
 
     def run(self, num_clips: int) -> list[dict]:
         span_min = (self._chunk_bounds(0)[1] - self._chunk_bounds(0)[0]) / 60
@@ -652,17 +684,30 @@ class Selector:
 def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, min_len: float,
                  max_len: float, model: str, claude_factory: Callable[[], Claude],
                  force: bool = False, focus: str | None = None,
-                 time_range: tuple[float | None, float | None] = (None, None)) -> list[dict]:
+                 time_range: tuple[float | None, float | None] = (None, None),
+                 new_search: bool = False, also_avoid: list[tuple[float, float]] = ()) -> list[dict]:
     if min_len <= 0 or max_len < min_len:
         raise ClipperError("--min-len must be positive and no larger than --max-len")
     sel = Selector(work, meta, transcript, min_len=min_len, max_len=max_len, model=model,
-                   claude_factory=claude_factory, force=force, focus=focus, time_range=time_range)
+                   claude_factory=claude_factory, force=force, focus=focus, time_range=time_range,
+                   new_search=new_search, also_avoid=also_avoid)
+    if new_search and sel.state["avoid"]:
+        log(f"select: looking for new clips, away from the {len(sel.state['avoid'])} suggested or made before")
     clips = sel.run(num_clips)
     write_json(work / "clips.json", clips)
     for c in clips:
         log(f"select: #{c['rank']} [{c['score']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} "
             f"({c['duration']:.0f}s) {c['title']}")
     return clips
+
+
+def saved_candidates(work: Path) -> list[dict]:
+    """Every clip Claude has suggested for this video, earlier searches first."""
+    path = work / "select.json"
+    if not path.exists():
+        return []
+    state = read_json(path)
+    return state.get("earlier", []) + state["candidates"]
 
 
 def clips_from_review(transcript: dict, meta: dict, candidates: list[dict], items: list[dict]) -> list[dict]:
