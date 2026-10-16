@@ -73,14 +73,15 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                         "main person (default auto)")
     g = p.add_argument_group("output")
     g.add_argument("--encoder", default=d.encoder, choices=ENCODERS,
-                   help="x264 (best quality per MB) or videotoolbox (Mac hardware, much faster) (default x264)")
+                   help="auto uses the Mac's hardware encoder (videotoolbox: much faster, slightly bigger "
+                        "files) when there is one, else x264 (best quality per MB) (default auto)")
     g.add_argument("--crf", type=int, default=d.crf, help="x264 quality, lower is better (default 20)")
     g.add_argument("--preset", default=d.preset, help="x264 speed preset (default medium)")
     g.add_argument("--no-posts", action="store_true", help="don't write post text and hashtags")
     g.add_argument("--download", default=d.download, choices=("sections", "full"),
-                   help="for links: 'sections' downloads the audio first and then only the video of the "
-                        "chosen clips (much faster for long videos); 'full' downloads the whole video "
-                        "(default sections)")
+                   help="'sections' takes only the sound at first, then just the video of the chosen "
+                        "clips (much faster for long videos); 'full' downloads and converts the whole video "
+                        "first (default sections)")
     g.add_argument("--work-dir", default=d.work_dir, help="where results are kept (default ./work)")
     g.add_argument("--force", choices=STEPS, metavar="STEP",
                    help=f"redo this step and every step after it ({', '.join(STEPS)})")

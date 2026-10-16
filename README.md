@@ -97,10 +97,10 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--logo FILE`, `--logo-position` | top-right | your logo on every clip (a PNG with transparency works best) |
 | `--jump-cuts` | `on` | `on` cuts long pauses and filler words ("um", "äh"), `pauses` only pauses, `off` nothing |
 | `--layout` | `auto` | two people in a shot: `follow` whoever talks, `split` screen, `auto` (split during back-and-forth, follow otherwise), `main` person only |
-| `--encoder` | `x264` | `videotoolbox` uses the Mac's hardware encoder: much faster, slightly bigger files |
+| `--encoder` | `auto` | `auto` uses the Mac's hardware encoder (`videotoolbox`: much faster, slightly bigger files) when there is one, else `x264` (best quality per MB) |
 | `--crf` / `--preset` | 20 / medium | x264 quality and speed |
 | `--no-posts` | | don't write post text |
-| `--download` | `sections` | for links: `sections` downloads the audio, then only the video of the chosen clips; `full` downloads the whole video |
+| `--download` | `sections` | `sections` takes only the sound at first, then just the video of the chosen clips (from the link or from your file); `full` downloads and converts the whole video first |
 | `--work-dir` | `./work` | where results are kept |
 | `--force STEP` | | redo STEP and every step after it |
 | `--stop-after STEP` | | stop early, e.g. `--stop-after select` to see Claude's picks before rendering |
@@ -113,15 +113,17 @@ clipper runs in six steps. Each step saves its result in `work/<video_id>/`, so 
 anything already done. Changing only `--num-clips`, for example, reuses the download, the
 transcript and Claude's proposals.
 
-**1. Ingest** (`ingest.py`). For a link, clipper first downloads only the audio with yt-dlp:
-that's all the next two steps need, and it's a fraction of the size of the video. The picture is
-fetched later and only for the clips (plus 3 seconds around each): ffmpeg reads just that stretch
-of the stream, best quality up to 1080p, and the section's sound is matched against the full audio
-track so captions and cuts line up exactly. For a two-hour podcast that means a few minutes of
-video instead of gigabytes, and no re-encoding of the whole thing. `--download full` downloads and
-converts the whole video instead, as happens for local files: ffmpeg converts it to H.264 at a
-constant frame rate, which keeps sound and picture in sync later. Either way the audio is also
-saved as a 16 kHz mono file for the speech recognizer. Playlists are expanded into their videos.
+**1. Ingest** (`ingest.py`). clipper starts with just the sound: that's all the next two steps
+need. For a link, yt-dlp downloads only the audio, in a smaller version that's plenty for speech
+recognition. For a file on your computer, ffmpeg copies its sound out in seconds (the clips are
+later cut from the original, so leave it where it is until you're done). The picture is taken
+later and only for the clips (plus 3 seconds around each): ffmpeg reads just that stretch of the
+stream or file, converts it to H.264 at a constant frame rate (at most 1080p), and the section's
+sound is matched against the full audio track so captions and cuts line up exactly. While one clip
+is being made, the next ones are fetched in the background. For a two-hour podcast that means a
+few minutes of video instead of gigabytes, and no conversion of the whole thing. `--download full`
+downloads and converts the whole video up front instead. The sound is saved as a 16 kHz mono file
+for the speech recognizer. Playlists are expanded into their videos.
 
 **2. Transcribe** (`transcribe.py`). Whisper writes down what's said, with a start and end time
 for every word: mlx-whisper on an Apple Silicon GPU, or faster-whisper on the CPU (the `small`
@@ -136,8 +138,9 @@ model runs at about 7–10x real time there, so a 20-minute video takes 2–3 mi
   line, 1–3 keywords to highlight, and a 0–100 score made of four 0–25 sub-scores: hook
   strength, makes sense on its own, emotion/surprise/humour, and clarity.
 - Long videos are sent in overlapping 15-minute chunks (the overlap is longer than the longest
-  clip, so no moment gets cut in half). Claude then sees all candidates together, re-scores
-  them on one common scale and marks any that repeat the point of a better one.
+  clip, so no moment gets cut in half), up to four at the same time. Claude then sees all
+  candidates together, re-scores them on one common scale and marks any that repeat the point of
+  a better one.
 - clipper moves each start and end to the nearest sentence boundary so no word is cut off. If a
   clip then runs too long, Claude chooses which sentences to keep (so the punchline survives);
   if it's too short, code adds the next sentence. Where clips overlap or repeat each other, the
@@ -168,7 +171,8 @@ is written for each clip as well.
 **6. Render** (`render.py`, `posts.py`). ffmpeg decodes the clip frame by frame; Python builds each
 frame (window, split screen or blurred background), zooms in a little on the hook and on Claude's
 keywords, draws the logo and progress bar, skips the frames removed by jump cuts, and hands the
-rest to a second ffmpeg, which burns in the captions, adds the matching audio and writes the MP4:
+rest to a second ffmpeg, which burns in the captions, adds the matching audio and writes the MP4
+(with the Mac's hardware encoder when there is one):
 1080×1920 for 9:16, 1080×1350 for 4:5, 1080×1080 for 1:1, 1920×1080 for 16:9. Each format gets its
 own framing (split screen only in the tall ones). A cover image and post text for each platform
 are written alongside.
@@ -178,7 +182,7 @@ are written alongside.
 ```
 work/<video_id>/
   meta.json            size, frame rate, duration, title
-  video.mp4            the whole video, normalised (local files and --download full)
+  video.mp4            the whole video, converted (only with --download full)
   audio_source.*       the downloaded sound (links)
   thumb.jpg            the video's thumbnail (links)
   audio.wav            16 kHz mono audio
@@ -187,7 +191,7 @@ work/<video_id>/
   clips.json           Claude's picks
   review.json          your picks from the web interface
   posts.json           post text per clip
-  clips/<start>-<end>/ per clip: section.mp4 (just this part of the video, for links), words.json,
+  clips/<start>-<end>/ per clip: section.mp4 (just this part of the video), words.json,
                        words_edited.json (your caption fixes), and per format (9x16/, 1x1/, …):
                        reframe.json, captions.ass, clip.mp4, cover.jpg
   output/              the finished clips, covers, caption files, post text and clips.json

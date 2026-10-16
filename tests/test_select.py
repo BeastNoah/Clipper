@@ -130,6 +130,17 @@ def test_long_video_is_chunked_rescored_and_cached(tmp_path, fake_claude):
     assert len(_calls(fake_claude)) == n
 
 
+def test_parts_of_a_long_video_are_asked_about_at_the_same_time(tmp_path, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "1")
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(700)])  # 3 chunks
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    select_clips(tmp_path, meta, {"words": words}, num_clips=3, min_len=20, max_len=45, model="test",
+                 claude_factory=lambda: Claude("test"))
+    starts = [c["t"] for c in _calls(fake_claude) if "<transcript>" in c["prompt"]]
+    assert len(starts) == 3
+    assert max(starts) - min(starts) < 0.9  # one by one, each would start after the one before had answered
+
+
 def test_asks_for_more_when_too_few_survive(tmp_path, fake_claude, monkeypatch):
     monkeypatch.setenv("FAKE_CLAUDE_MAX", "1")
     words = make_words([f"Here is a thought number {i} worth sharing." for i in range(120)])  # ~6.5 min

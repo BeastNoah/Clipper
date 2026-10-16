@@ -22,9 +22,13 @@ from .render import ENCODERS, LOGO_POSITIONS, Look, check_ffmpeg_has_libass, ren
 from .select import clips_from_review, select_clips
 from .transcribe import clip_words, transcribe
 from .translate import spread, translate_clip
-from .util import ClipperError, check_cancel, log, read_json, report, require_tool, slugify, write_json
+from .util import (
+    Cancelled, ClipperError, check_cancel, log, read_json, report, require_tool, slugify, thread_pool,
+    write_json,
+)
 
 STEPS = ["ingest", "transcribe", "select", "reframe", "captions", "render"]
+SECTIONS_AT_ONCE = 3  # clip sections fetched in the background while earlier clips are being made
 
 
 @dataclass
@@ -57,7 +61,7 @@ class Options:
     logo_position: str = "top-right"
     jump_cuts: str = "on"               # on | pauses | off
     layout: str = "auto"                # auto | follow | split | main
-    encoder: str = "x264"               # x264 | videotoolbox | auto
+    encoder: str = "auto"               # auto (the Mac's hardware encoder if there is one) | x264 | videotoolbox
     crf: int = 20
     preset: str = "medium"
     posts: bool = True
@@ -188,6 +192,16 @@ def save_caption_lines(work: Path, clip: dict, lines: list[dict]) -> None:
 
 # ---------------------------------------------------------------------------------------------
 
+def _prefetch(work: Path, meta: dict, clip: dict) -> None:
+    """Fetch a clip's section ahead of time; a failure is left for the clip's own turn to retry and report."""
+    try:
+        clip_video(work, meta, clip, clip_dir_for(work, clip))
+    except Cancelled:
+        raise
+    except ClipperError:
+        pass
+
+
 def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: Options) -> list[dict]:
     """Steps 4-6 (reframe, captions, render) for clips that have already been chosen."""
     do_render = opts.stop_after not in ("reframe", "captions")
@@ -205,55 +219,65 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
             if old.suffix in (".mp4", ".jpg", ".txt", ".srt") or old.name == "clips.json":
                 old.unlink()
 
-    for clip in clips:
-        check_cancel()
-        report("step", f"clip {clip['rank']} of {len(clips)}")
-        cdir = clip_dir_for(work, clip)
-        cdir.mkdir(parents=True, exist_ok=True)
-        words = clip_words(work, transcript, clip, cdir, opts.caption_model, opts.whisper_backend,
-                           force=opts.forced("captions"))
-        fixed = edited_words(work, clip)
-        if fixed is not None:
-            log(f"captions #{clip['rank']}: using your corrections")
-            words = fixed
-        src = clip_video(work, meta, clip, cdir)
-        edit = EditMap(plan_cuts(words, clip["start"], clip["end"], fps, opts.jump_cuts,
-                                 loud.is_quiet if loud else None))
-        spoken = map_words(words, clip["start"], edit)
-        cap_words, cap_title, keywords = spoken, clip["title"], clip.get("keywords")
-        if opts.caption_language:
-            cap_words, cap_title = translate_clip(cdir, spoken, clip["title"], opts.caption_language, claude)
-            keywords = None  # the keywords were picked in the spoken language
-        look = Look(zoom=zoom_windows(spoken, clip.get("keywords") or [], edit.duration) if opts.zoom else [],
-                    logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
-                    progress=style.highlight if opts.progress_bar else None)
-        clip["final_duration"] = round(edit.duration, 2)
-        base = f"{clip['rank']:02d}_{slugify(clip['title'])}"
-        outputs = {}
-        for n, fmt in enumerate(formats):
-            fdir = cdir / fmt.tag
-            fdir.mkdir(exist_ok=True)
-            plan = reframe(work, meta, clip, fdir, words, opts.layout, force=opts.forced("reframe"), src=src, fmt=fmt)
-            ass = make_captions(cap_words, edit.duration, fdir, style, fmt,
-                                title=cap_title if opts.title_overlay else None, cover_title=cap_title,
-                                keywords=keywords)
-            if not do_render:
-                continue
-            mp4 = render(work, meta, clip, plan, edit, ass, fdir, fmt=fmt, look=look, encoder=opts.encoder,
-                         crf=opts.crf, preset=opts.preset, force=opts.forced("render"), src=src)
-            name = base if n == 0 else f"{base}_{fmt.tag}"
-            _publish(mp4, out_dir / f"{name}.mp4")
-            _publish(fdir / "cover.jpg", out_dir / f"{name}.jpg")
-            outputs[fmt.name] = {"file": f"{name}.mp4", "cover": f"{name}.jpg"}
-        if do_render:
-            clip["file"], clip["cover"] = outputs[formats[0].name]["file"], outputs[formats[0].name]["cover"]
-            clip["formats"] = outputs
-            (out_dir / f"{base}.srt").write_text(build_srt(spoken), encoding="utf-8")
-            clip["srt"] = [f"{base}.srt"]
+    # Sections of the video are fetched a few at a time in the background while earlier clips are made.
+    pool = thread_pool(SECTIONS_AT_ONCE) if meta.get("video") == "sections" else None
+    fetches = {c["rank"]: pool.submit(_prefetch, work, meta, c) for c in clips} if pool else {}
+    try:
+        for clip in clips:
+            check_cancel()
+            report("step", f"clip {clip['rank']} of {len(clips)}")
+            cdir = clip_dir_for(work, clip)
+            cdir.mkdir(parents=True, exist_ok=True)
+            words = clip_words(work, transcript, clip, cdir, opts.caption_model, opts.whisper_backend,
+                               force=opts.forced("captions"))
+            fixed = edited_words(work, clip)
+            if fixed is not None:
+                log(f"captions #{clip['rank']}: using your corrections")
+                words = fixed
+            if clip["rank"] in fetches:
+                fetches[clip["rank"]].result()  # this clip's section, fetched in the background
+            src = clip_video(work, meta, clip, cdir)
+            edit = EditMap(plan_cuts(words, clip["start"], clip["end"], fps, opts.jump_cuts,
+                                     loud.is_quiet if loud else None))
+            spoken = map_words(words, clip["start"], edit)
+            cap_words, cap_title, keywords = spoken, clip["title"], clip.get("keywords")
             if opts.caption_language:
-                tag = slugify(opts.caption_language, 12)
-                (out_dir / f"{base}.{tag}.srt").write_text(build_srt(cap_words), encoding="utf-8")
-                clip["srt"].append(f"{base}.{tag}.srt")
+                cap_words, cap_title = translate_clip(cdir, spoken, clip["title"], opts.caption_language, claude)
+                keywords = None  # the keywords were picked in the spoken language
+            look = Look(zoom=zoom_windows(spoken, clip.get("keywords") or [], edit.duration) if opts.zoom else [],
+                        logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
+                        progress=style.highlight if opts.progress_bar else None)
+            clip["final_duration"] = round(edit.duration, 2)
+            base = f"{clip['rank']:02d}_{slugify(clip['title'])}"
+            outputs = {}
+            for n, fmt in enumerate(formats):
+                fdir = cdir / fmt.tag
+                fdir.mkdir(exist_ok=True)
+                plan = reframe(work, meta, clip, fdir, words, opts.layout, force=opts.forced("reframe"),
+                               src=src, fmt=fmt)
+                ass = make_captions(cap_words, edit.duration, fdir, style, fmt,
+                                    title=cap_title if opts.title_overlay else None, cover_title=cap_title,
+                                    keywords=keywords)
+                if not do_render:
+                    continue
+                mp4 = render(work, meta, clip, plan, edit, ass, fdir, fmt=fmt, look=look, encoder=opts.encoder,
+                             crf=opts.crf, preset=opts.preset, force=opts.forced("render"), src=src)
+                name = base if n == 0 else f"{base}_{fmt.tag}"
+                _publish(mp4, out_dir / f"{name}.mp4")
+                _publish(fdir / "cover.jpg", out_dir / f"{name}.jpg")
+                outputs[fmt.name] = {"file": f"{name}.mp4", "cover": f"{name}.jpg"}
+            if do_render:
+                clip["file"], clip["cover"] = outputs[formats[0].name]["file"], outputs[formats[0].name]["cover"]
+                clip["formats"] = outputs
+                (out_dir / f"{base}.srt").write_text(build_srt(spoken), encoding="utf-8")
+                clip["srt"] = [f"{base}.srt"]
+                if opts.caption_language:
+                    tag = slugify(opts.caption_language, 12)
+                    (out_dir / f"{base}.{tag}.srt").write_text(build_srt(cap_words), encoding="utf-8")
+                    clip["srt"].append(f"{base}.{tag}.srt")
+    finally:
+        if pool:
+            pool.shutdown(cancel_futures=True)
 
     if do_render and opts.posts:
         try:

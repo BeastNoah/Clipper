@@ -28,6 +28,8 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
     assert (meta["width"], meta["height"], meta["fps"]) == (640, 360, "25/1")
     audio = ffprobe(work / "audio.wav")["streams"][0]
     assert (audio["sample_rate"], audio["channels"]) == ("16000", 1)
+    # only the sound is taken from a file at first; the clips' parts are converted later
+    assert meta["video"] == "sections" and not (work / "video.mp4").exists()
 
     words = make_words([f"This is spoken sentence number {i} today." for i in range(14)], start=0.5)
     write_json(work / "transcript.json", {
@@ -47,6 +49,8 @@ def test_pipeline_end_to_end(tmp_path, fake_claude):
         assert 8 <= float(info["format"]["duration"]) <= 12.5
     clips = json.loads((work / "output" / "clips.json").read_text())
     assert [c["rank"] for c in clips] == [1, 2]
+    sections = sorted((work / "clips").glob("*/section.mp4"))
+    assert len(sections) == 2 and all(float(ffprobe(p)["format"]["duration"]) < 20 for p in sections)
     for c in clips:  # cover image and post text next to each clip
         assert (work / "output" / c["cover"]).stat().st_size > 1000
         assert "#fyp" in (work / "output" / c["file"]).with_suffix(".txt").read_text()
@@ -103,3 +107,26 @@ def test_pipeline_with_formats_translation_logo_and_focus(tmp_path, fake_claude)
     assert "[EN]" in ass and "Title,,0,0,0,,{\\fad(150,300)}[EN]" in ass  # translated lines and title
     prompts = [json.loads(l)["prompt"] for l in fake_claude.read_text().splitlines()]
     assert any("looking for: the best bits" in p for p in prompts)
+
+
+def test_whole_file_conversion_on_request(tmp_path, fake_claude):
+    src = tmp_path / "talk.mov"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=30",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=30", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    root = tmp_path / "work"
+    args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "8", "--max-len", "12",
+            "--preset", "ultrafast", "--caption-model", "none", "--download", "full"]
+    assert cli.main([*args, "--stop-after", "ingest"]) == 0
+    (work,) = root.iterdir()
+    meta = json.loads((work / "meta.json").read_text())
+    assert meta["video"] == "full" and (work / "video.mp4").exists()
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "en", "words": make_words(
+            [f"This is spoken sentence number {i} today." for i in range(10)], start=0.5)},
+    })
+    assert cli.main(args) == 0
+    assert len(list((work / "output").glob("*.mp4"))) == 1
+    assert not list((work / "clips").glob("*/section.mp4"))

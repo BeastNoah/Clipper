@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -41,6 +42,12 @@ def report(kind: str, payload: Any) -> None:
     sink = getattr(_local, "sink", None)
     if sink is not None:
         sink(kind, payload)
+
+
+def thread_pool(workers: int) -> ThreadPoolExecutor:
+    """Threads that log to, and can be cancelled by, the same UI job as the caller."""
+    return ThreadPoolExecutor(max_workers=workers, initializer=set_reporter,
+                              initargs=(getattr(_local, "sink", None), getattr(_local, "cancel", None)))
 
 
 def check_cancel() -> None:
@@ -114,6 +121,7 @@ def run_proc(cmd: list[str], *, input: bytes | None = None, cwd: Path | None = N
             out, err = proc.communicate(input, timeout=0.5)
             return proc.returncode, out, err
         except subprocess.TimeoutExpired:
+            input = None  # communicate() keeps sending what's left of it; passing it again is an error
             expired = deadline is not None and time.monotonic() > deadline
             try:
                 if expired:

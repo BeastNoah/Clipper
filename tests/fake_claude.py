@@ -6,18 +6,22 @@ FAKE_CLAUDE_BAD_FIRST=1: the first answer in a conversation is malformed, to exe
 FAKE_CLAUDE_MAX: propose at most this many clips per request.
 FAKE_CLAUDE_LONG=1: propose clips that run past the maximum length (so clipper asks for a trim).
 FAKE_CLAUDE_DUP=1: when re-scoring, mark the second clip as a duplicate of the first.
+FAKE_CLAUDE_SLEEP: seconds to think before answering a request for clips.
 """
+import fcntl
 import json
 import os
 import re
 import sys
+import time
 
 argv = sys.argv[1:]
 prompt = sys.stdin.read()
 resume = argv[argv.index("--resume") + 1] if "--resume" in argv else None
 if os.environ.get("FAKE_CLAUDE_LOG"):
     with open(os.environ["FAKE_CLAUDE_LOG"], "a") as f:
-        f.write(json.dumps({"argv": argv, "prompt": prompt}) + "\n")
+        fcntl.flock(f, fcntl.LOCK_EX)  # clipper runs several of us at once
+        f.write(json.dumps({"argv": argv, "prompt": prompt, "t": time.time()}) + "\n")
 
 SESSION = argv[argv.index("--session-id") + 1] if "--session-id" in argv else resume
 
@@ -32,6 +36,7 @@ if os.environ.get("FAKE_CLAUDE_BAD_FIRST") and not resume:
     reply("Sure! Here are some great clips: (no JSON, oops)")
 
 if "<transcript>" in prompt:
+    time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))
     body = prompt.split("<transcript>")[1].split("</transcript>")[0]
     lines = [re.match(r"([\d.]+)-([\d.]+) \| (.*)", l) for l in body.strip().splitlines()]
     lines = [(float(m[1]), float(m[2]), re.sub(r" \[.*\]$", "", m[3])) for m in lines if m]

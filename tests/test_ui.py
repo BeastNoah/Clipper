@@ -66,8 +66,11 @@ def test_ui_api(server):
     status, detail, _ = call(port, "GET", f"/api/videos/{vid}")
     assert len(detail["sentences"]) == 7 and detail["candidates"] == []
 
-    status, body, r = call(port, "GET", f"/media/{vid}/video.mp4", headers={"Range": "bytes=0-99"})
+    # a video on this computer isn't converted as a whole: the player gets the original file
+    assert meta["video"] == "sections" and meta["local"] and not (work / "video.mp4").exists()
+    status, body, r = call(port, "GET", f"/media/{vid}/source", headers={"Range": "bytes=0-99"})
     assert status == 206 and len(body) == 100 and r.getheader("Content-Range").startswith("bytes 0-99/")
+    assert r.getheader("Content-Type") == "video/mp4"
     status, body, r = call(port, "GET", f"/api/videos/{vid}/frame?t=2")
     assert status == 200 and r.getheader("Content-Type") == "image/jpeg"
 

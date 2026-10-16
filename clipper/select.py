@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from .audio import Loudness, sentence_cues
 from .llm import Claude, InvalidReply, extract_json
-from .util import Cancelled, ClipperError, fingerprint, fmt_time, log, read_json, write_json
+from .util import Cancelled, ClipperError, fingerprint, fmt_time, log, read_json, thread_pool, write_json
 
 SELECT_VERSION = 2
 CHUNK_SECONDS = 15 * 60
@@ -25,6 +25,7 @@ MAX_SENTENCE_SECONDS = 15.0  # longer "sentences" (run-ons, missing punctuation)
 SENTENCE_GAP = 2.0           # a pause this long ends a sentence even without punctuation
 PAD_BEFORE, PAD_AFTER = 0.2, 0.4
 EXTRA_ROUNDS = 2             # how many times to ask Claude for more when too few clips survive
+CLAUDE_AT_ONCE = 4           # requests in flight at the same time for the parts of a long video
 
 _END = (".", "?", "!", "…", "。", "？", "！")
 _TRAILING = "\"'”’)»]"
@@ -556,6 +557,7 @@ class Selector:
                 self._commit(proposal, call, si, ei)
 
     def _round(self, key: str, count_for_chunk: Callable[[int], int], with_avoid: bool) -> None:
+        jobs = []
         for k, (a, b) in enumerate(self.chunks):
             call = f"{key}:{k}"
             if call in self.state["done"]:
@@ -569,18 +571,34 @@ class Selector:
                 if hi - lo - taken < self.min_len:
                     self.state["done"].append(call)
                     continue
-            count = count_for_chunk(k)
+            jobs.append((k, call, count_for_chunk(k), avoid))
+        if not jobs:
+            return
+        claude = self.claude
+
+        def ask(job: tuple) -> list[dict]:
+            k, _, count, avoid = job
+            (a, b), (lo, hi) = self.chunks[k], self._chunk_bounds(k)
             where = f"chunk {k + 1}/{len(self.chunks)}" if len(self.chunks) > 1 else "transcript"
             log(f"select: asking Claude for up to {count} clips ({where}, {fmt_time(lo)}-{fmt_time(hi)})")
             prompt = _proposal_prompt(self.title, self.tl, a, b, count, self.min_len, self.max_len, avoid,
                                       self.cues, self.focus)
-            proposals = self.claude.ask(SYSTEM_PROMPT, prompt, lambda r: parse_proposals(r, lo, hi),
-                                        what=f"proposals for {where}")
-            for p in proposals[:count]:
-                self._add(p, call)
-            self._trim()
-            self.state["done"].append(call)
-            self._save()
+            return claude.ask(SYSTEM_PROMPT, prompt, lambda r: parse_proposals(r, lo, hi),
+                              what=f"proposals for {where}")
+
+        # The parts of a long video are asked about at the same time; the answers are taken in order,
+        # so each part's trims and its place in select.json are the same as when asked one by one.
+        pool = thread_pool(min(CLAUDE_AT_ONCE, len(jobs)))
+        try:
+            futures = [pool.submit(ask, job) for job in jobs]
+            for (k, call, count, _), future in zip(jobs, futures):
+                for p in future.result()[:count]:
+                    self._add(p, call)
+                self._trim()
+                self.state["done"].append(call)
+                self._save()
+        finally:
+            pool.shutdown(cancel_futures=True)
 
     def _rescore(self) -> None:
         cands = self.state["candidates"]

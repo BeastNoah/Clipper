@@ -200,8 +200,8 @@ function settingsFields(opts, keys) {
     layout: () => sel("layout", "Two people", C.layouts,
       ["auto", "follow the speaker", "split screen", "main person only"]),
     jump_cuts: () => sel("jump_cuts", "Jump cuts", C.jump_cuts, ["off", "pauses only", "pauses + filler words"]),
-    encoder: () => sel("encoder", "Encoder", C.encoders, ["x264 (best quality)", "VideoToolbox (fast, Mac)", "auto"]),
-    download: () => sel("download", "Download from links", ["sections", "full"], ["only the clips' video (fast)", "the whole video"]),
+    encoder: () => sel("encoder", "Encoder", C.encoders, ["x264 (best quality)", "VideoToolbox (fast, Mac)", "auto (VideoToolbox on a Mac)"]),
+    download: () => sel("download", "Video", ["sections", "full"], ["only the clips' parts (fast)", "convert the whole video first"]),
     language: () => txt("language", "Spoken language", "detect"),
     caption_language: () => txt("caption_language", "Translate captions to", "e.g. English"),
     range_start: () => txt("range_start", "Only from", "0:00"),
@@ -415,16 +415,22 @@ function reviewView() {
 }
 
 // Without a downloaded video (only the clip sections get fetched), YouTube's own player previews the
-// moments; for other sites the downloaded sound does.
+// moments; for other sites the downloaded sound does. A video on this computer plays from the original
+// file, or from its sound if the browser can't play that file type.
 function makePlayer(v) {
   const sections = v.meta?.video === "sections";
   if (sections && v.meta.youtube_id) {
     return h("iframe", { class: "player", id: "player", title: "Preview", allowfullscreen: true,
       allow: "autoplay; encrypted-media; picture-in-picture", src: youtubeSrc(v.meta.youtube_id, 0, null, false) });
   }
-  const el = sections
-    ? h("audio", { class: "player audio", id: "player", src: `/media/${v.id}/audio.wav`, controls: true, preload: "metadata" })
-    : h("video", { class: "player", id: "player", src: `/media/${v.id}/video.mp4`, controls: true, preload: "metadata" });
+  const audio = `/media/${v.id}/audio.wav`;
+  const el = sections && !v.meta.local
+    ? h("audio", { class: "player audio", id: "player", src: audio, controls: true, preload: "metadata" })
+    : h("video", { class: "player", id: "player", controls: true, preload: "metadata",
+        src: `/media/${v.id}/${sections ? "source" : "video.mp4"}` });
+  if (sections && v.meta.local) {
+    el.addEventListener("error", () => { if (!el.src.endsWith("audio.wav")) el.src = audio; });
+  }
   el.addEventListener("timeupdate", () => {
     if (S.stopAt != null && el.currentTime >= S.stopAt) { el.pause(); S.stopAt = null; }
   });

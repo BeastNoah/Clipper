@@ -102,7 +102,7 @@ def doctor(argv: list[str]) -> int:
                    "macOS: brew install ffmpeg-full (or a build with --enable-libass)")
         if sys.platform == "darwin":
             if has_videotoolbox():
-                r.ok("hardware encoder", "h264_videotoolbox (use --encoder videotoolbox)")
+                r.ok("hardware encoder", "h264_videotoolbox (used automatically)")
             else:
                 r.warn("hardware encoder", "h264_videotoolbox not available in this ffmpeg")
 

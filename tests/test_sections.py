@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from clipper import cli, ingest
-from clipper.ingest import clip_video, extract_audio, measure_offset
+from clipper.ingest import clip_video, display_size, extract_audio, measure_offset
 from clipper.util import ffprobe, video_stream, write_json
 from conftest import make_words
 
@@ -134,3 +134,11 @@ def test_pipeline_from_a_link_without_downloading_the_whole_video(tmp_path, cdn,
     v = video_stream(ffprobe(out))
     assert (v["width"], v["height"]) == (1080, 1920)
     assert list((work / "clips").glob("*/section.mp4")) and not (work / "video.mp4").exists()
+
+
+def test_display_size_of_rotated_and_large_videos():
+    assert display_size({"width": 1920, "height": 1080}) == (1920, 1080)
+    assert display_size({"width": 3840, "height": 2160}) == (1920, 1080)
+    phone = {"width": 1920, "height": 1080, "side_data_list": [{"rotation": -90}]}
+    assert display_size(phone) == (608, 1080)
+    assert display_size({"width": 1440, "height": 1080, "sample_aspect_ratio": "4:3"}) == (1920, 1080)

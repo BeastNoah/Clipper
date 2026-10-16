@@ -1,9 +1,10 @@
-"""Step 1: get the video, convert it to a standard constant-frame-rate MP4 and pull out 16 kHz mono audio.
+"""Step 1: get the sound of the video as 16 kHz mono audio, and (on request) a normalised copy of the video.
 
-For links the default is to download only the audio at first: that's all transcription and clip
-selection need. The picture is fetched later, only for the stretches that become clips
-(see clip_video), straight from the stream with ffmpeg. A long video then costs a few minutes of
-video download instead of all of it.
+By default only the sound is prepared at first: that's all transcription and clip selection need.
+The picture is fetched later, only for the stretches that become clips (see clip_video): for links
+straight from the stream with ffmpeg, for files on disk straight from the file. A long video then
+costs a few minutes of video download and conversion instead of all of it. With download "full",
+the whole video is downloaded and converted to a standard constant-frame-rate MP4 up front.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import hashlib
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass
@@ -33,6 +35,8 @@ INGEST_VERSION = 1
 VIDEO_FORMAT = f"bv*[height<={MAX_HEIGHT}]+ba/b[height<={MAX_HEIGHT}]/bv*+ba/b"
 DOWNLOAD_MODES = ("sections", "full")
 SECTION_MARGIN = 3.0   # seconds of extra video fetched around a clip
+# Whisper doesn't need music-grade sound: a ~50-70 kbps track is a third of the size of the best one.
+SPEECH_AUDIO = "ba[abr<=80][abr>=40]"
 
 
 def is_url(source: str) -> bool:
@@ -187,7 +191,8 @@ def _thumbnail(info: dict, dest: Path) -> None:
 
 def _ingest_audio_only(url: str, info: dict, work: Path, video_id: str, title: str) -> dict:
     choice = _stream_choice(info)
-    src = download(url, work, fmt=choice["audio_format"], stem="audio_source")
+    # the clips' own sound later comes from the best track (choice["audio_format"]), not this one
+    src = download(url, work, fmt=f"{SPEECH_AUDIO}/{choice['audio_format']}", stem="audio_source")
     extract_audio(src, work / "audio.wav")
     _thumbnail(info, work / "thumb.jpg")
     rate = pick_frame_rate({"avg_frame_rate": str(Fraction(choice["fps"]).limit_denominator(1001))
@@ -204,6 +209,44 @@ def _ingest_audio_only(url: str, info: dict, work: Path, video_id: str, title: s
     }
 
 
+def display_size(stream: dict) -> tuple[int, int]:
+    """Width and height of a video stream as the clips will get it: square pixels, upright, at most
+    MAX_HEIGHT tall (what _encode_args makes of it)."""
+    w, h = int(stream["width"]), int(stream["height"])
+    sar = parse_rate(stream.get("sample_aspect_ratio", "1:1").replace(":", "/")) or Fraction(1)
+    w = int(w * sar) // 2 * 2
+    rotation = next((d.get("rotation") for d in stream.get("side_data_list") or [] if "rotation" in d),
+                    (stream.get("tags") or {}).get("rotate", 0))
+    if abs(int(float(rotation or 0))) % 180 == 90:
+        w, h = h, w
+    if h > MAX_HEIGHT:
+        w, h = int(round(w * MAX_HEIGHT / h / 2)) * 2, MAX_HEIGHT
+    return w, h
+
+
+def _ingest_local_audio(path: Path, work: Path, video_id: str, title: str) -> dict:
+    probe = ffprobe(path)
+    vs = _check_streams(probe, path)
+    rate = pick_frame_rate(vs)
+    extract_audio(path, work / "audio.wav")
+    width, height = display_size(vs)
+    return {
+        "version": INGEST_VERSION, "video_id": video_id, "title": title, "source": str(path),
+        "video": "sections", "local": True,
+        "fps": f"{rate.numerator}/{rate.denominator}", "width": width, "height": height,
+        "duration": float(ffprobe(work / "audio.wav")["format"]["duration"]),
+    }
+
+
+def _check_streams(probe: dict, path: Path) -> dict:
+    vs = video_stream(probe)
+    if vs is None:
+        raise ClipperError(f"{path.name} has no video stream")
+    if audio_stream(probe) is None:
+        raise ClipperError(f"{path.name} has no audio stream; clipper needs speech to pick clips")
+    return vs
+
+
 def ingest(source: str, work_root: Path, force: bool = False, download_mode: str = "sections") -> tuple[Path, dict]:
     """Returns (work dir for this video, meta)."""
     if download_mode not in DOWNLOAD_MODES:
@@ -217,7 +260,6 @@ def ingest(source: str, work_root: Path, force: bool = False, download_mode: str
         if not path.is_file():
             raise ClipperError(f"No such file: {source}")
         video_id, title, source = local_video_id(path), path.stem, str(path)
-        download_mode = "full"  # nothing to download: the file is already here
 
     work = work_root / video_id
     work.mkdir(parents=True, exist_ok=True)
@@ -230,19 +272,19 @@ def ingest(source: str, work_root: Path, force: bool = False, download_mode: str
             log(f"ingest: reusing {work}")
             return work, meta
 
-    if info is not None and download_mode == "sections":
-        meta = _ingest_audio_only(source, info, work, video_id, title)
+    if download_mode == "sections":
+        if info is not None:
+            meta = _ingest_audio_only(source, info, work, video_id, title)
+            log(f"ingest: audio only for now ({meta['duration']:.0f}s); video is fetched just for the clips")
+        else:
+            meta = _ingest_local_audio(Path(source), work, video_id, title)
+            log(f"ingest: took the sound ({meta['duration']:.0f}s); only the clips' parts of the video "
+                "get converted later")
         write_json(meta_path, meta)
-        log(f"ingest: audio only for now ({meta['duration']:.0f}s); video is fetched just for the clips")
         return work, meta
 
     src = download(source, work) if is_url(source) else Path(source)
-    probe = ffprobe(src)
-    vs = video_stream(probe)
-    if vs is None:
-        raise ClipperError(f"{src.name} has no video stream")
-    if audio_stream(probe) is None:
-        raise ClipperError(f"{src.name} has no audio stream; clipper needs speech to pick clips")
+    vs = _check_streams(ffprobe(src), src)
 
     rate = pick_frame_rate(vs)
     log(f"ingest: converting to constant {float(rate):.3f} fps H.264 (max {MAX_HEIGHT}p)")
@@ -285,11 +327,29 @@ class ClipVideo:
 
 
 _inputs_cache: dict[tuple, tuple[float, list]] = {}
+_inputs_lock = threading.Lock()  # clips fetch their sections in parallel; look the URLs up only once
+
+
+def local_source(meta: dict) -> Path | None:
+    """The original file, for a video on this computer that was never converted as a whole."""
+    return Path(meta["source"]) if meta.get("local") else None
 
 
 def section_inputs(meta: dict) -> list[tuple[str, dict]]:
-    """Direct stream URLs (with the HTTP headers they need) for the video and audio formats chosen at
-    ingest. They expire after a few hours, so they're looked up again when older than an hour."""
+    """What to read a section from: the original file, or for links the direct stream URLs (with the
+    HTTP headers they need) of the formats chosen at ingest. Those expire after a few hours, so
+    they're looked up again when older than an hour."""
+    if meta.get("local"):
+        path = local_source(meta)
+        if not path.is_file():
+            raise ClipperError(f"The original video {path} is gone (moved or deleted); clipper needs it to "
+                               "cut the clips. Put it back or run clipper on it again.")
+        return [(str(path), {})]
+    with _inputs_lock:
+        return _stream_inputs(meta)
+
+
+def _stream_inputs(meta: dict) -> list[tuple[str, dict]]:
     fmts = meta["formats"]
     key = (meta["source"], fmts["video"], fmts["audio"])
     hit = _inputs_cache.get(key)
@@ -306,8 +366,8 @@ def section_inputs(meta: dict) -> list[tuple[str, dict]]:
 
 
 def fetch_section(inputs: list[tuple[str, dict]], start: float, end: float, rate: Fraction, dest: Path) -> None:
-    """Download and encode only [start, end) of the stream(s). ffmpeg seeks inside the remote files with
-    HTTP range requests, so only that part (plus up to one keyframe interval) is transferred."""
+    """Download (or read) and encode only [start, end) of the stream(s). ffmpeg seeks inside remote files
+    with HTTP range requests, so only that part (plus up to one keyframe interval) is transferred."""
     cmd = ["ffmpeg", "-y", "-v", "error", "-nostdin"]
     for url, headers in inputs:
         if str(url).startswith(("http://", "https://")):
@@ -360,7 +420,8 @@ def clip_video(work: Path, meta: dict, clip: dict, clip_dir: Path) -> ClipVideo:
     if not info or info.get("range") != want:
         clip_dir.mkdir(parents=True, exist_ok=True)
         rate = Fraction(meta["fps"])
-        log(f"clip #{clip['rank']}: fetching {want[1] - want[0]:.0f}s of video")
+        log(f"clip #{clip['rank']}: {'converting' if meta.get('local') else 'fetching'} "
+            f"{want[1] - want[0]:.0f}s of video")
         fetch_section(section_inputs(meta), want[0], want[1], rate, path)
         # Check where the section really starts by matching its sound against the full audio track.
         from .transcribe import load_audio

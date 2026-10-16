@@ -34,6 +34,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from ..captions import PRESETS
 from ..edit import MODES as JUMP_CUT_MODES
 from ..formats import SIZES
+from ..ingest import local_source
 from ..pipeline import (
     Options, caption_lines, edited_words, load_video, process, produce_reviewed, rerender, save_caption_lines,
 )
@@ -183,14 +184,23 @@ def video_detail(work: Path) -> dict:
     return data
 
 
+def source_video(work: Path) -> Path | None:
+    """The whole video, if this computer has it: the converted copy or the original file."""
+    if (work / "video.mp4").exists():
+        return work / "video.mp4"
+    src = local_source(read_json(work / "meta.json"))
+    return src if src and src.is_file() else None
+
+
 def frame_jpeg(work: Path, t: float, width: int = 360) -> Path:
-    if not (work / "video.mp4").exists():
+    video = source_video(work)
+    if video is None:
         return work / "thumb.jpg"  # only the audio was downloaded: use the video's thumbnail
     thumbs = work / "thumbs"
     thumbs.mkdir(exist_ok=True)
     out = thumbs / f"{int(t * 1000)}_{width}.jpg"
     if not out.exists():
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(work / "video.mp4"),
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(video),
                         "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "4", str(out)],
                        capture_output=True, check=False)
     return out
@@ -344,6 +354,9 @@ class Handler(BaseHTTPRequestHandler):
         if parts[0] == "media" and len(parts) >= 3:
             work = self._work(parts[1])
             rel = parts[2:]
+            if work is not None and rel == ["source"]:  # the original of a video on this computer
+                src = local_source(read_json(work / "meta.json"))
+                return self._file(src) if src else self._error(404, "not found")
             if work is None or not (rel in (["video.mp4"], ["audio.wav"], ["thumb.jpg"])
                                     or (len(rel) == 2 and rel[0] == "output"
                                                               and re.match(r"^[\w.-]+$", rel[1]))):
