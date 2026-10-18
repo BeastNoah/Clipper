@@ -45,7 +45,7 @@ def has_videotoolbox() -> bool:
 def check_ffmpeg_has_libass() -> None:
     if not has_libass():
         raise ClipperError("Your ffmpeg was built without libass, which is needed to burn in captions. "
-                           "Install a full build (on macOS: brew install ffmpeg-full, or brew reinstall ffmpeg).")
+                           "Install a full build (on macOS: brew install ffmpeg-full, or set FFMPEG_DIR to a folder with a libass-enabled ffmpeg).")
 
 
 def resolve_encoder(name: str) -> str:
