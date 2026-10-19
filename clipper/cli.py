@@ -75,6 +75,11 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--logo", default=None, metavar="FILE", help="your logo on every clip (PNG with transparency)")
     g.add_argument("--logo-position", default=d.logo_position,
                    choices=("top-left", "top-right", "bottom-left", "bottom-right"))
+    g.add_argument("--watermark", default=None, metavar="TEXT", help="your own text on every clip, e.g. '@yourname'")
+    g.add_argument("--watermark-position", default=d.watermark_position,
+                   choices=("top-left", "top-right", "bottom-left", "bottom-right"))
+    g.add_argument("--watermark-opacity", type=int, default=d.watermark_opacity, metavar="PERCENT",
+                   help="how solid the watermark text and the logo are, 10-100 (default 90)")
     g.add_argument("--jump-cuts", default=d.jump_cuts, choices=JUMP_CUT_MODES,
                    help="cut out long pauses and filler words (on), only pauses, or nothing (default on)")
     g.add_argument("--layout", default=d.layout, choices=LAYOUTS,
@@ -104,6 +109,8 @@ def options_from_args(args: argparse.Namespace) -> Options:
         download=args.download, prompt=args.prompt, range_start=args.range_start, range_end=args.range_end,
         caption_language=args.caption_language, formats=args.formats, zoom=not args.no_zoom,
         progress_bar=args.progress_bar, logo=args.logo, logo_position=args.logo_position,
+        watermark=args.watermark, watermark_position=args.watermark_position,
+        watermark_opacity=args.watermark_opacity,
         model=args.model, whisper_model=args.whisper_model, whisper_backend=args.whisper_backend,
         language=args.language, caption_model=args.caption_model, caption_style=args.caption_style,
         font=args.font, caption_size=args.caption_size, highlight_color=args.highlight_color,

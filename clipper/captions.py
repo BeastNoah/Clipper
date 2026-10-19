@@ -241,12 +241,35 @@ def _title_style_line(style: CaptionStyle, name: str, size: int, align: int, mar
             f"{align},90,90,{margin_v},1")
 
 
+@dataclass(frozen=True)
+class Watermark:
+    """Your own text on every frame of the clip, e.g. "@yourname"."""
+    text: str
+    position: str = "bottom-left"  # top-left | top-right | bottom-left | bottom-right
+    opacity: int = 90              # percent
+    shift: int = 0                 # pixels towards the middle, to make room for a logo in the same corner
+
+
+WATERMARK_ALIGN = {"top-left": 7, "top-right": 9, "bottom-left": 1, "bottom-right": 3}
+
+
+def _watermark_style_line(style: CaptionStyle, mark: Watermark, fmt: Format = VERTICAL) -> str:
+    margin, top, bottom = fmt.corner_margins()
+    margin_v = (top if mark.position.startswith("top") else bottom) + mark.shift
+    alpha = round(255 * (1 - min(max(mark.opacity, 0), 100) / 100))
+    size = max(34, fmt.v(46))
+    return (f"Style: Watermark,{style.font},{size},{ass_color('#FFFFFF', alpha)},{ass_color('#FFFFFF', alpha)},"
+            f"{ass_color('#000000', min(255, alpha + 0x30))},{ass_color('#000000', min(255, alpha + 0x60))},"
+            f"-1,0,0,0,100,100,0,0,1,2,1,{WATERMARK_ALIGN[mark.position]},{margin},{margin},{margin_v},1")
+
+
 def _escape(text: str) -> str:
     return text.replace("\\", "⧵").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
 def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS["bold"],
-              keywords: list[str] | None = None, title: str | None = None, fmt: Format = VERTICAL) -> str:
+              keywords: list[str] | None = None, title: str | None = None, fmt: Format = VERTICAL,
+              watermark: Watermark | None = None) -> str:
     """words have times in the finished clip."""
     emphasized = keyword_positions(words, keywords or [])
     index = {id(w): i for i, w in enumerate(words)}
@@ -285,6 +308,9 @@ def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS[
                     parts.append(text)
             events.append(f"Dialogue: 0,{_ts(start)},{_ts(end)},Default,,0,0,0,,{''.join(parts)}")
     styles = [_caption_style_line(style, fmt), _title_style_line(style, "Title", 62, 8, fmt.v(250))]
+    if watermark:
+        styles.append(_watermark_style_line(style, watermark, fmt))
+        events.append(f"Dialogue: 2,{_ts(0)},{_ts(duration)},Watermark,,0,0,0,,{_escape(watermark.text)}")
     return _header(styles, fmt) + "\n".join(events) + "\n"
 
 
@@ -302,11 +328,12 @@ def _write_if_changed(path: Path, text: str) -> Path:
 
 
 def make_captions(words: list[dict], duration: float, out_dir: Path, style: CaptionStyle, fmt: Format = VERTICAL,
-                  title: str | None = None, cover_title: str = "", keywords: list[str] | None = None) -> Path:
+                  title: str | None = None, cover_title: str = "", keywords: list[str] | None = None,
+                  watermark: Watermark | None = None) -> Path:
     """Write captions.ass (and cover.ass) for one clip in one format. `words` have times in the finished
     clip. Cheap, so it's rebuilt every run; unchanged files are left alone so renders stay cached."""
     _write_if_changed(out_dir / "cover.ass", build_cover_ass(cover_title or title or "", style, fmt))
-    return _write_if_changed(out_dir / "captions.ass", build_ass(words, duration, style, keywords, title, fmt))
+    return _write_if_changed(out_dir / "captions.ass", build_ass(words, duration, style, keywords, title, fmt, watermark))
 
 
 def srt_lines(words: list[dict], max_chars: int = 42) -> list[tuple[float, float, str]]:

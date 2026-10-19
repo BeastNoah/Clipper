@@ -215,8 +215,13 @@ function settingsFields(opts, keys) {
     caption_language: () => txt("caption_language", "Translate captions to", "e.g. English"),
     range_start: () => txt("range_start", "Only from", "0:00"),
     range_end: () => txt("range_end", "Until", "the end"),
-    logo: () => txt("logo", "Logo file", "/path/to/logo.png"),
+    logo: () => logoField(opts),
     logo_position: () => sel("logo_position", "Logo position", ["top-right", "top-left", "bottom-right", "bottom-left"]),
+    watermark: () => txt("watermark", "Watermark text", "e.g. @yourname"),
+    watermark_position: () => sel("watermark_position", "Watermark position", ["bottom-left", "bottom-right", "top-left", "top-right"]),
+    watermark_opacity: () => h("label", { class: "field" }, h("span", {}, "Watermark opacity (%)"),
+      h("input", { type: "number", min: 10, max: 100, step: 5, value: opts.watermark_opacity,
+        onchange: e => saveOption("watermark_opacity", Math.min(100, Math.max(10, Number(e.target.value) || 90))) })),
     formats,
     zoom: () => chk("zoom", "Auto-zoom on key moments"),
     earlier_parts: () => chk("earlier_parts", "Claude may add earlier set-up parts"),
@@ -241,18 +246,60 @@ async function startJob(source) {
   } catch (e) { toast(e.message); }
 }
 
+// Sends a file to this computer; resolves to {path} of where it was saved.
+function putFile(file, onprogress) {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("PUT", `/api/upload?name=${encodeURIComponent(file.name)}`);
+    xhr.upload.onprogress = e => { if (e.lengthComputable && onprogress) onprogress(e.loaded / e.total); };
+    xhr.onload = () => xhr.status < 300 ? resolve(JSON.parse(xhr.responseText)) : reject(new Error(xhr.responseText));
+    xhr.onerror = () => reject(new Error("upload failed"));
+    xhr.send(file);
+  });
+}
+
+// The logo: a path on this computer, or a picture uploaded from this browser (e.g. from a phone).
+function logoField(opts) {
+  const path = h("input", { type: "text", placeholder: "/path/to/logo.png", value: opts.logo ?? "",
+    onchange: e => { saveOption("logo", e.target.value.trim() || null); show(); } });
+  const preview = h("img", { class: "logo-preview", alt: "" });
+  const status = h("span", { class: "small muted" });
+  const pick = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", hidden: true, onchange: async e => {
+    const file = e.target.files[0];
+    e.target.value = "";
+    if (!file) return;
+    status.textContent = "Uploading…";
+    try {
+      const r = await putFile(file, f => { status.textContent = `Uploading… ${Math.round(f * 100)}%`; });
+      saveOption("logo", r.path);
+      path.value = r.path;
+      local = URL.createObjectURL(file);
+      status.textContent = "";
+      show();
+    } catch (err) { status.textContent = "Upload failed"; toast(err.message); }
+  } });
+  let local = null;
+  const clear = h("button", { class: "btn ghost small", type: "button", onclick: () => {
+    saveOption("logo", null); path.value = ""; local = null; show();
+  } }, "Remove");
+  const show = () => {
+    const has = !!options().logo;
+    preview.hidden = !(has && local);
+    if (local) preview.src = local;
+    clear.hidden = !has;
+  };
+  show();
+  return h("div", { class: "field logo-field" }, h("span", {}, "Logo / picture watermark"), path,
+    h("div", { class: "row", style: "gap:8px" },
+      h("button", { class: "btn small", type: "button", onclick: () => pick.click() }, "Upload picture"),
+      clear, preview, status, pick));
+}
+
 async function upload(file) {
   const label = $("#drop-label");
   label.textContent = `Uploading ${file.name}…`;
   try {
-    const r = await new Promise((resolve, reject) => {
-      const xhr = new XMLHttpRequest();
-      xhr.open("PUT", `/api/upload?name=${encodeURIComponent(file.name)}`);
-      xhr.upload.onprogress = e => { if (e.lengthComputable) label.textContent = `Uploading ${file.name}… ${Math.round(e.loaded / e.total * 100)}%`; };
-      xhr.onload = () => xhr.status < 300 ? resolve(JSON.parse(xhr.responseText)) : reject(new Error(xhr.responseText));
-      xhr.onerror = () => reject(new Error("upload failed"));
-      xhr.send(file);
-    });
+    const r = await putFile(file, f => { label.textContent = `Uploading ${file.name}… ${Math.round(f * 100)}%`; });
     label.textContent = DROP_TEXT;
     await startJob(r.path);
   } catch (e) {
@@ -293,7 +340,11 @@ async function renderHome() {
       h("details", {}, h("summary", {}, "More settings"),
         h("div", { class: "settings" }, ...settingsFields(opts, ["range_start", "range_end", "model", "whisper_model",
           "caption_model", "language", "caption_language", "caption_style", "caption_position", "layout", "jump_cuts",
-          "encoder", "download", "logo", "logo_position"])),
+          "encoder", "download"])),
+        h("h3", { class: "settings-head" }, "Watermark"),
+        h("div", { class: "small muted" }, "Your own text and/or picture on every clip. A PNG with a transparent background works best."),
+        h("div", { class: "settings" }, ...settingsFields(opts, ["watermark", "watermark_position", "watermark_opacity",
+          "logo", "logo_position"])),
         h("div", { style: "margin-top:14px" }, ...settingsFields(opts, ["formats"])),
         h("div", { class: "row", style: "margin-top:14px; gap:22px" }, ...settingsFields(opts, ["uppercase", "title_overlay",
           "zoom", "progress_bar", "posts", "earlier_parts"]))),

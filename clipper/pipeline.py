@@ -12,15 +12,15 @@ from pathlib import Path
 from typing import Callable
 
 from .audio import Loudness
-from .captions import PRESETS, _phrases, build_srt, keyword_positions, make_captions, make_style, map_words
+from .captions import PRESETS, Watermark, _phrases, build_srt, keyword_positions, make_captions, make_style, map_words
 from .edit import MODES as JUMP_CUT_MODES
 from .edit import EditMap, plan_cuts
-from .formats import get_format, parse_formats, parse_time
+from .formats import Format, get_format, parse_formats, parse_time
 from .ingest import DOWNLOAD_MODES, clip_video, ingest
 from .llm import Claude
 from .posts import format_post, write_posts
 from .reframe import LAYOUTS, reframe
-from .render import ENCODERS, LOGO_POSITIONS, Look, Piece, check_ffmpeg_has_libass, render
+from .render import ENCODERS, LOGO_POSITIONS, Look, Piece, check_ffmpeg_has_libass, logo_size, read_logo, render
 from .select import clip_parts, clip_spans, clips_from_review, saved_candidates, select_clips
 from .transcribe import clip_words, transcribe, words_in
 from .translate import spread, translate_clip
@@ -61,6 +61,9 @@ class Options:
     progress_bar: bool = False
     logo: str | None = None             # image file, ideally a PNG with transparency
     logo_position: str = "top-right"
+    watermark: str | None = None        # your own text on every clip, e.g. "@yourname"
+    watermark_position: str = "bottom-left"
+    watermark_opacity: int = 90         # percent, for the watermark text and the logo
     jump_cuts: str = "on"               # on | pauses | off
     earlier_parts: bool = True          # Claude may play earlier parts of the video (a set-up) before a clip
     layout: str = "auto"                # auto | follow | split | main
@@ -82,6 +85,7 @@ class Options:
             ("layout", self.layout, LAYOUTS), ("encoder", self.encoder, ENCODERS),
             ("caption position", self.caption_position, ("lower", "middle")),
             ("download", self.download, DOWNLOAD_MODES), ("logo position", self.logo_position, LOGO_POSITIONS),
+            ("watermark position", self.watermark_position, LOGO_POSITIONS),
             ("whisper backend", self.whisper_backend, ("auto", "faster-whisper", "mlx")),
             ("force", self.force, (None, *STEPS)), ("stop after", self.stop_after, (None, *STEPS)),
         ]:
@@ -95,11 +99,15 @@ class Options:
             self.style  # noqa: B018 - builds the caption style, which checks font size and colour
         except ValueError as e:
             problems.append(str(e))
-        for name in ("prompt", "caption_language", "logo", "language"):
+        if not 10 <= self.watermark_opacity <= 100:
+            problems.append("watermark opacity must be between 10 and 100")
+        for name in ("prompt", "caption_language", "logo", "watermark", "language"):
             value = getattr(self, name)
             setattr(self, name, value.strip() if isinstance(value, str) and value.strip() else None)
         if self.logo and not Path(self.logo).expanduser().is_file():
             problems.append(f"no logo file at {self.logo}")
+        if self.watermark and len(self.watermark) > 80:
+            problems.append("keep the watermark text to 80 characters")
         if problems:
             raise ClipperError("; ".join(problems))
         return self
@@ -120,6 +128,16 @@ class Options:
         return make_style(self.caption_style, font=self.font, size=self.caption_size,
                           highlight=self.highlight_color, uppercase=self.uppercase,
                           position=self.caption_position)
+
+
+def watermark_for(opts: Options, fmt: Format, logo_shape: tuple[int, ...] | None = None) -> Watermark | None:
+    """The watermark text for one format; in the logo's corner it sits next to the logo, towards the middle."""
+    if not opts.watermark:
+        return None
+    shift = 0
+    if logo_shape is not None and opts.watermark_position == opts.logo_position:
+        shift = logo_size(logo_shape, fmt)[1] + fmt.v(16)
+    return Watermark(opts.watermark, opts.watermark_position, opts.watermark_opacity, shift)
 
 
 def claude_factory(opts: Options, work: Path) -> Callable[[], Claude]:
@@ -254,6 +272,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         check_ffmpeg_has_libass()
     style = opts.style
     formats = [get_format(n) for n in opts.formats]
+    logo_shape = read_logo(Path(opts.logo).expanduser()).shape if opts.logo and opts.watermark else None
     fps = float(Fraction(meta["fps"]))
     loud = Loudness.from_work(work) if opts.jump_cuts != "off" else None
     claude = claude_factory(opts, work)
@@ -307,7 +326,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                 keywords = None  # the keywords were picked in the spoken language
             look = Look(zoom=zoom_windows(spoken, clip.get("keywords") or [], duration) if opts.zoom else [],
                         logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
-                        progress=style.highlight if opts.progress_bar else None)
+                        opacity=opts.watermark_opacity, progress=style.highlight if opts.progress_bar else None)
             clip["final_duration"] = round(duration, 2)
             clip["timeline"] = timeline
             base = f"{clip['rank']:02d}_{slugify(clip['title'])}"
@@ -323,7 +342,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                     plans.append(Piece(src, part["start"], part["end"], plan, edit))
                 ass = make_captions(cap_words, duration, fdir, style, fmt,
                                     title=cap_title if opts.title_overlay else None, cover_title=cap_title,
-                                    keywords=keywords)
+                                    keywords=keywords, watermark=watermark_for(opts, fmt, logo_shape))
                 if not do_render:
                     continue
                 mp4 = render(work, meta, clip, plans, ass, fdir, fmt=fmt, look=look, encoder=opts.encoder,

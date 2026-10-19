@@ -4,11 +4,11 @@ import re
 import numpy as np
 import pytest
 
-from clipper.captions import build_ass, build_srt, map_words
+from clipper.captions import Watermark, build_ass, build_srt, map_words
 from clipper.edit import EditMap
 from clipper.formats import get_format, parse_formats, parse_time
 from clipper.llm import Claude
-from clipper.pipeline import Options, zoom_windows
+from clipper.pipeline import Options, watermark_for, zoom_windows
 from clipper.render import Look, Overlay, crop_frame, fit_frame, split_frame, zoom_at
 from clipper.translate import spread, translate_clip
 from clipper.util import ClipperError
@@ -87,6 +87,48 @@ def test_tall_and_16_bit_logos(tmp_path, ratio):
         assert img[y + h // 2, x + w // 2].min() >= 225  # white at 90% opacity, not wrapped-around noise
 
 
+def test_watermark_text():
+    words = map_words(make_words(["Hello there friends."]), 0.0, EditMap([(0.0, 10.0)]))
+    fmt = get_format("9:16")
+    assert "Watermark" not in build_ass(words, 5, fmt=fmt)
+    ass = build_ass(words, 5, fmt=fmt, watermark=Watermark("@me", "top-right", 50))
+    style = next(l for l in ass.splitlines() if l.startswith("Style: Watermark")).split(",")
+    margin, top, _ = fmt.corner_margins()
+    assert style[3] == "&H80FFFFFF" and style[18:22] == ["9", str(margin), str(margin), str(top)]  # half see-through
+    assert "Dialogue: 2,0:00:00.00,0:00:05.00,Watermark,,0,0,0,,@me" in ass  # on screen for the whole clip
+
+
+def test_watermark_moves_aside_for_a_logo_in_the_same_corner(tmp_path):
+    import cv2
+
+    cv2.imwrite(str(tmp_path / "logo.png"), np.full((50, 100, 4), 255, np.uint8))
+    fmt = get_format("9:16")
+    opts = Options(watermark="  @me  ", logo=str(tmp_path / "logo.png"), logo_position="bottom-left",
+                   watermark_position="bottom-left").validate()
+    assert opts.watermark == "@me"
+    shape = (50, 100, 4)
+    assert watermark_for(opts, fmt, shape).shift == 151 * 50 // 100 + fmt.v(16)  # the logo is 151px wide
+    opts.watermark_position = "top-left"
+    assert watermark_for(opts, fmt, shape).shift == 0
+    assert watermark_for(Options(), fmt) is None
+    with pytest.raises(ClipperError, match="opacity"):
+        Options(watermark="@me", watermark_opacity=0).validate()
+    with pytest.raises(ClipperError, match="80 characters"):
+        Options(watermark="x" * 81).validate()
+
+
+def test_logo_opacity(tmp_path):
+    import cv2
+
+    cv2.imwrite(str(tmp_path / "logo.png"), np.full((40, 80, 4), 255, np.uint8))
+    fmt = get_format("9:16")
+    ov = Overlay(Look(logo=tmp_path / "logo.png", opacity=50), fmt)
+    img = ov.apply(np.zeros((fmt.height, fmt.width, 3), np.uint8), 0.0)
+    x, y = ov.pos
+    assert 120 <= img[y + 5, x + 5, 0] <= 130  # white logo at half strength on black
+    assert "opacity" not in Look().key() and Look(opacity=50).key()["opacity"] == 50
+
+
 def test_formats_change_the_caption_canvas():
     words = map_words(make_words(["We tried it. And it worked!"]), 0.0, EditMap([(0.0, 10.0)]))
     sq = build_ass(words, 5, fmt=get_format("1:1"))
@@ -130,7 +172,7 @@ def test_focus_and_time_range_reach_claude(tmp_path, fake_claude):
 
 
 def test_translation_into_a_script_without_spaces():
-    from clipper.captions import build_ass, srt_lines
+    from clipper.captions import Watermark, build_ass, srt_lines
 
     words = spread(0.0, 6.0, "我们今天去公园散步，然后吃了一顿非常好吃的晚饭。")
     assert len(words) > 4 and all(len(w["w"]) <= 5 for w in words)  # not one huge "word" running off screen
