@@ -28,7 +28,15 @@ git clone https://github.com/BeastNoah/Clipper && cd Clipper
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e '.[mac]'        # [mac] adds mlx-whisper: much faster speech recognition on Apple Silicon
 clipper doctor                 # checks all of the above and says what's missing
+clipper app                    # makes Clipper.app, so from now on you can skip the terminal
 ```
+
+After `clipper app` you open clipper like any other Mac app: from Launchpad, Spotlight (Cmd+Space,
+"Clipper") or the Dock. It starts the web interface in the background and opens it in your
+browser; opening it again while it runs just brings the page back. The app remembers this
+folder, your `work` folder and your terminal's PATH (so it finds ffmpeg and claude), so run
+`clipper app` again if you move the folder. `clipper app --phone` makes it open the interface for
+your phone too. If it can't start, it shows why; the full log is in `work/.ui.log`.
 
 If captions fail with "built without libass", install a full ffmpeg build (`brew install
 ffmpeg-full`). On first use clipper downloads the Whisper models (about 500 MB for `small`, the
@@ -37,7 +45,7 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
 
 ## The web interface
 
-`clipper ui` opens a page in your browser. By default only this computer can use it.
+`clipper ui` (or Clipper.app, see above) opens a page in your browser. By default only this computer can use it.
 
 - **Make clips:** paste a link or a file path, or drop a video file, and optionally say what Claude
   should look for ("funny moments", "everything about pricing"). Pick how many clips and how long;
