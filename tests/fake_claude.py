@@ -75,7 +75,8 @@ if "<transcript>" in prompt:
         if not any(s < b and e > a for a, b in avoid):
             n = len(clips)
             clips.append({"start": s, "end": e, "title": f"Moment {s:.0f}", "hook": lines[i][2],
-                          "scores": {"hook": 10 + n % 15, "standalone": 15, "emotion": 12, "clarity": 20},
+                          "type": ["joke", "story", "hot take"][n % 3],
+                          "scores": {"hook": 4 + n % 6, "payoff": 6, "reaction": 5, "pace": 8},
                           "keywords": [lines[i][2].split()[-1].strip(".,!?")]})
         i = j + 2
     reply({"clips": clips})
@@ -89,9 +90,10 @@ if "<clips>" in prompt and '"posts"' in prompt:
 if "<clips>" in prompt:
     ids = re.findall(r"^\[(c\d+)\]", prompt, re.M)
     dup = os.environ.get("FAKE_CLAUDE_DUP")
-    reply({"scores": [{"id": c, "hook": 25 - k % 20, "standalone": 20, "emotion": 15, "clarity": 18,
-                       "duplicate_of": ids[0] if dup and k == 1 else None}
-                      for k, c in enumerate(ids)]})
+    # rank them in the order they were listed, with scores that fall along the ranking
+    reply({"ranking": [{"id": c, "hook": 10 - k % 8, "payoff": 8, "reaction": 6, "pace": 7,
+                        "duplicate_of": ids[0] if dup and k == 1 else None}
+                       for k, c in enumerate(ids)]})
 
 if "<lines>" in prompt:
     body = prompt.split("<lines>")[1].split("</lines>")[0]

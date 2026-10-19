@@ -396,7 +396,7 @@ def rerender(work: Path, opts: Options) -> list[dict]:
     path = work / "output" / "clips.json"
     if not path.exists():
         raise ClipperError("There are no rendered clips to update.")
-    keep = ("rank", "id", "title", "hook", "score", "scores", "start", "end", "duration", "si", "ei",
+    keep = ("rank", "id", "title", "hook", "type", "score", "scores", "start", "end", "duration", "si", "ei",
             "text", "keywords")
     clips = [{k: c[k] for k in keep if k in c} for c in read_json(path)]
     return produce(work, meta, transcript, clips, opts)
