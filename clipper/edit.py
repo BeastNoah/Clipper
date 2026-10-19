@@ -60,8 +60,9 @@ def plan_cuts(words: list[dict], start: float, end: float, fps: float, mode: str
             removed.append((c0, c1))
     # Each filler word goes too, however short the pauses around it (never into a spoken word).
     for fs, fe in fillers:
-        before = max((e for s, e in spoken if e <= fs + 0.01), default=0.0)
-        after = min((s for s, e in spoken if s >= fe - 0.01), default=duration)
+        # The nearest spoken words on each side, even when Whisper's times overlap the filler's.
+        before = max((e for s, e in spoken if s < fs), default=0.0)
+        after = min((s for s, e in spoken if e > fe), default=duration)
         c0, c1 = grid(max(fs - 0.04, before + 0.05)), grid(min(fe + 0.06, after - 0.03))
         if c1 > c0:
             removed.append((c0, c1))

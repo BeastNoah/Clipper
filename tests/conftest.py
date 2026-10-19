@@ -26,3 +26,12 @@ def fake_claude(monkeypatch, tmp_path):
     monkeypatch.setenv("CLIPPER_CLAUDE_BIN", str(wrapper))
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
     return log
+
+
+@pytest.fixture(autouse=True)
+def _same_whisper_backend_everywhere(monkeypatch):
+    """Tests seed transcripts cached under the faster-whisper backend. On an Apple Silicon Mac with
+    mlx-whisper installed, "auto" would pick mlx, miss that cache and transcribe the test tone."""
+    import clipper.transcribe
+
+    monkeypatch.setattr(clipper.transcribe, "mlx_available", lambda: False)

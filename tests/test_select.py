@@ -6,7 +6,7 @@ import pytest
 from clipper.llm import Claude, InvalidReply
 from clipper.select import (
     CHUNK_SECONDS, Timeline, clips_from_review, make_chunks, parse_proposals, parse_rescores,
-    merged_length, resolve_overlaps, saved_candidates, select_clips, snap_and_fit, split_sentences,
+    merged_length, resolve_overlaps, saved_candidates, select_clips, snap, snap_and_fit, split_sentences,
 )
 from clipper.util import ClipperError
 from conftest import make_words
@@ -139,6 +139,22 @@ def test_parts_of_a_long_video_are_asked_about_at_the_same_time(tmp_path, fake_c
     starts = [c["t"] for c in _calls(fake_claude) if "<transcript>" in c["prompt"]]
     assert len(starts) == 3
     assert max(starts) - min(starts) < 0.9  # one by one, each would start after the one before had answered
+
+
+def test_clips_stay_inside_the_chosen_time_range():
+    words = make_words([f"This is sentence {i} of the test." for i in range(60)])
+    sents = split_sentences(words)
+    lo, hi = 20, 29  # the sentences of the chosen range
+    tl = Timeline(sents, words, words[-1]["e"] + 1, lo, hi)
+    s = tl.sentences
+    # a short clip at the end of the range has to grow, but only backwards (never past the range end)
+    si, ei = snap_and_fit(tl, s[28].start, s[29].end, 8, 20)
+    assert lo <= si <= ei == hi and tl.dur(si, ei) >= 8
+    # times a little outside the range snap to its first and last sentence
+    assert snap(tl, s[17].start, s[33].end) == (lo, hi)
+    # at the very start of the range it grows forwards only
+    si, ei = snap_and_fit(tl, s[20].start, s[20].end, 8, 20)
+    assert si == lo and ei <= hi
 
 
 def test_new_search_keeps_and_steers_clear_of_earlier_suggestions(tmp_path, fake_claude):

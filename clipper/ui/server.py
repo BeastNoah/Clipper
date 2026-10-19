@@ -344,8 +344,11 @@ class Handler(BaseHTTPRequestHandler):
             if "key" in qs:  # first visit from the phone link: remember the key, then drop it from the URL
                 self.send_response(303)
                 self.send_header("Location", "/")
-                self.send_header("Set-Cookie", f"{COOKIE}={qs['key'][0]}; Path=/; Max-Age=31536000; "
-                                               "HttpOnly; SameSite=Lax")
+                given, key = qs["key"][0], self.app.key
+                # Only the real key goes into the cookie: anything else could smuggle in extra headers.
+                if key is not None and hmac.compare_digest(given.encode(), key.encode()):
+                    self.send_header("Set-Cookie", f"{COOKIE}={key}; Path=/; Max-Age=31536000; "
+                                                   "HttpOnly; SameSite=Lax")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
@@ -440,8 +443,10 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return self._error(400, "empty upload")
-        dest_dir = self.app.root / "_uploads"
-        dest_dir.mkdir(parents=True, exist_ok=True)
+        # Every upload gets its own folder: a later file with the same name must never replace one that
+        # an earlier video still cuts its clips from.
+        dest_dir = self.app.root / "_uploads" / uuid.uuid4().hex[:12]
+        dest_dir.mkdir(parents=True)
         dest = dest_dir / name
         tmp = dest.with_name(dest.name + ".part")
         with tmp.open("wb") as f:
@@ -454,6 +459,7 @@ class Handler(BaseHTTPRequestHandler):
                 left -= len(chunk)
         if left:
             tmp.unlink(missing_ok=True)
+            dest_dir.rmdir()
             return self._error(400, "upload was interrupted")
         tmp.replace(dest)
         return self._json({"path": str(dest)}, 201)

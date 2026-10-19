@@ -247,8 +247,11 @@ def parse_trims(reply: str, jobs: dict[str, tuple[int, int]], tl: "Timeline", mi
 # Timing fixes
 
 class Timeline:
-    def __init__(self, sentences: list[Sentence], words: list[dict], duration: float):
+    def __init__(self, sentences: list[Sentence], words: list[dict], duration: float,
+                 lo: int = 0, hi: int | None = None):
+        """lo..hi: the sentences clips may use (a chosen time range); snapping and fitting stay inside."""
         self.sentences, self.words, self.duration = sentences, words, duration
+        self.lo, self.hi = lo, len(sentences) - 1 if hi is None else hi
         self._starts = [s.start for s in sentences]
 
     def clip_start(self, si: int) -> float:
@@ -266,11 +269,11 @@ class Timeline:
 
     def nearest_start(self, t: float) -> int:
         k = bisect_left(self._starts, t)
-        near = [i for i in (k - 1, k) if 0 <= i < len(self.sentences)]
+        near = [i for i in (k - 1, k) if self.lo <= i <= self.hi] or [min(max(k, self.lo), self.hi)]
         return min(near, key=lambda i: abs(self.sentences[i].start - t))
 
     def nearest_end(self, t: float, at_least: int) -> int:
-        return min(range(at_least, len(self.sentences)), key=lambda i: abs(self.sentences[i].end - t))
+        return min(range(max(at_least, self.lo), self.hi + 1), key=lambda i: abs(self.sentences[i].end - t))
 
     def text(self, si: int, ei: int) -> str:
         a, b = self.sentences[si].w0, self.sentences[ei].w1
@@ -289,15 +292,14 @@ def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float) -> tuple
     Trimming happens at the end (the start holds the hook). Extending adds the next sentence,
     or the previous one when there is no room after. Returns None if the clip can't be made to fit.
     """
-    n = len(tl.sentences)
     while ei > si and tl.dur(si, ei) > max_len:
         ei -= 1
     if tl.dur(si, ei) > max_len:
         return None
     while tl.dur(si, ei) < min_len:
-        if ei + 1 < n and tl.dur(si, ei + 1) <= max_len:
+        if ei + 1 <= tl.hi and tl.dur(si, ei + 1) <= max_len:
             ei += 1
-        elif si > 0 and tl.dur(si - 1, ei) <= max_len:
+        elif si > tl.lo and tl.dur(si - 1, ei) <= max_len:
             si -= 1
         else:
             return None
@@ -477,7 +479,6 @@ class Selector:
         self.sentences = split_sentences(words)
         if not self.sentences:
             raise ClipperError("The transcript is empty.")
-        self.tl = Timeline(self.sentences, words, meta["duration"])
         self.cues = sentence_cues(Loudness.from_work(work), words, self.sentences, meta["duration"])
         self.title = meta.get("title", "")
         self.min_len, self.max_len = min_len, max_len
@@ -486,6 +487,7 @@ class Selector:
                 if (lo is None or s.start >= lo - 0.5) and (hi is None or s.end <= hi + 0.5)]
         if not pool:
             raise ClipperError(f"No speech between {fmt_time(lo or 0)} and {fmt_time(hi or meta['duration'])}.")
+        self.tl = Timeline(self.sentences, words, meta["duration"], pool[0].i, pool[-1].i)
         self.focus = (focus or "").strip() or None
         self.chunks = make_chunks(pool, overlap=max_len + 30)
         self._claude_factory, self._claude = claude_factory, None

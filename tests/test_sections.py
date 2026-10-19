@@ -142,3 +142,24 @@ def test_display_size_of_rotated_and_large_videos():
     phone = {"width": 1920, "height": 1080, "side_data_list": [{"rotation": -90}]}
     assert display_size(phone) == (608, 1080)
     assert display_size({"width": 1440, "height": 1080, "sample_aspect_ratio": "4:3"}) == (1920, 1080)
+
+
+def test_a_moved_video_is_found_at_its_new_place(tmp_path):
+    from clipper.ingest import ingest, section_inputs
+
+    first = tmp_path / "Downloads" / "talk.mp4"
+    first.parent.mkdir()
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=4",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=4", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(first)], check=True)
+    work_root = tmp_path / "work"
+    work, meta = ingest(str(first), work_root)
+    assert meta["source"] == str(first.resolve())
+
+    moved = tmp_path / "Videos" / "talk.mp4"
+    moved.parent.mkdir()
+    first.rename(moved)
+    work2, meta2 = ingest(str(moved), work_root)
+    assert work2 == work and meta2["source"] == str(moved.resolve())
+    assert section_inputs(meta2) == [(str(moved.resolve()), {})]
+    assert json.loads((work / "meta.json").read_text())["source"] == str(moved.resolve())

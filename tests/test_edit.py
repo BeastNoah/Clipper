@@ -27,6 +27,15 @@ def test_filler_words_are_cut_with_the_pause_around_them():
     assert is_filler(" Ähm,") and not is_filler("ham")
 
 
+def test_filler_cut_never_reaches_into_overlapping_words():
+    # Whisper's times often overlap: "basically" starts before "um" ends
+    words = [w("So", 0.0, 0.5), w("um", 0.6, 1.0), w("basically", 0.9, 1.6), w("yes.", 1.7, 2.0)]
+    keep = plan_cuts(words, 0.0, 3.0, 30, "on")
+    spoken = [(0.0, 0.5), (0.9, 1.6), (1.7, 2.0)]
+    for s, e in spoken:  # every spoken word is kept whole
+        assert any(a <= s + 1e-9 and e - 1e-9 <= b for a, b in keep), (s, e, keep)
+
+
 def test_audible_gaps_are_kept():
     def quiet(a, b):  # something audible (laughter, say) between 13.5s and 14.5s
         return b <= 13.5 or a >= 14.5

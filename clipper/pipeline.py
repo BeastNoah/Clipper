@@ -214,10 +214,12 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
     claude = claude_factory(opts, work)
     out_dir = work / "output"
     out_dir.mkdir(exist_ok=True)
-    if do_render:  # the list goes first, so an interrupted render never points at deleted files
-        for old in out_dir.iterdir():
-            if old.suffix in (".mp4", ".jpg", ".txt", ".srt") or old.name == "clips.json":
-                old.unlink()
+    # New files are made in a staging folder and only replace the old ones once every clip is done, so a
+    # cancelled or failed render leaves the clips that were already there (and their list) untouched.
+    stage = out_dir / ".next"
+    if do_render:
+        shutil.rmtree(stage, ignore_errors=True)
+        stage.mkdir()
 
     # Sections of the video are fetched a few at a time in the background while earlier clips are made.
     pool = thread_pool(SECTIONS_AT_ONCE) if meta.get("video") == "sections" else None
@@ -263,17 +265,17 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                 mp4 = render(work, meta, clip, plan, edit, ass, fdir, fmt=fmt, look=look, encoder=opts.encoder,
                              crf=opts.crf, preset=opts.preset, force=opts.forced("render"), src=src)
                 name = base if n == 0 else f"{base}_{fmt.tag}"
-                _publish(mp4, out_dir / f"{name}.mp4")
-                _publish(fdir / "cover.jpg", out_dir / f"{name}.jpg")
+                _publish(mp4, stage / f"{name}.mp4")
+                _publish(fdir / "cover.jpg", stage / f"{name}.jpg")
                 outputs[fmt.name] = {"file": f"{name}.mp4", "cover": f"{name}.jpg"}
             if do_render:
                 clip["file"], clip["cover"] = outputs[formats[0].name]["file"], outputs[formats[0].name]["cover"]
                 clip["formats"] = outputs
-                (out_dir / f"{base}.srt").write_text(build_srt(spoken), encoding="utf-8")
+                (stage / f"{base}.srt").write_text(build_srt(spoken), encoding="utf-8")
                 clip["srt"] = [f"{base}.srt"]
                 if opts.caption_language:
                     tag = slugify(opts.caption_language, 12)
-                    (out_dir / f"{base}.{tag}.srt").write_text(build_srt(cap_words), encoding="utf-8")
+                    (stage / f"{base}.{tag}.srt").write_text(build_srt(cap_words), encoding="utf-8")
                     clip["srt"].append(f"{base}.{tag}.srt")
     finally:
         if pool:
@@ -288,8 +290,15 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         for clip in clips:
             if clip["id"] in posts:
                 clip["post"] = posts[clip["id"]]
-                text_file = out_dir / f"{clip['rank']:02d}_{slugify(clip['title'])}.txt"
+                text_file = stage / f"{clip['rank']:02d}_{slugify(clip['title'])}.txt"
                 text_file.write_text(format_post(clip, posts[clip["id"]]), encoding="utf-8")
+    if do_render:
+        for old in out_dir.iterdir():
+            if old.suffix in (".mp4", ".jpg", ".txt", ".srt"):
+                old.unlink()
+        for new in stage.iterdir():
+            os.replace(new, out_dir / new.name)
+        stage.rmdir()
     write_json(out_dir / "clips.json", clips)
     return clips
 

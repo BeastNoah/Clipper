@@ -104,17 +104,23 @@ class Overlay:
             img = cv2.imread(str(look.logo), cv2.IMREAD_UNCHANGED)
             if img is None:
                 raise ClipperError(f"Couldn't read the logo {look.logo}")
+            if img.dtype == np.uint16:  # 16-bit PNGs: scale down to 8 bits before blending
+                img = (img >> 8).astype(np.uint8)
             if img.ndim == 2:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGRA)
             elif img.shape[2] == 3:
                 img = np.dstack([img, np.full(img.shape[:2], 255, np.uint8)])
             w = int(fmt.width * (0.14 if fmt.ratio < 1 else 0.09))
             h = max(1, int(img.shape[0] * w / img.shape[1]))
+            max_h = int(fmt.height * 0.2)  # tall logos are sized by height so they always fit the frame
+            if h > max_h:
+                h, w = max_h, max(1, int(img.shape[1] * max_h / img.shape[0]))
             img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
             margin = int(min(fmt.width, fmt.height) * 0.04)
             top = fmt.v(150) if fmt.ratio < 1 else margin  # below the platforms' top bar on vertical video
             x = margin if "left" in look.logo_position else fmt.width - w - margin
             y = top if "top" in look.logo_position else fmt.height - h - fmt.v(330 if fmt.ratio < 1 else 0) - margin
+            x, y = min(max(0, x), fmt.width - w), min(max(0, y), fmt.height - h)
             self.logo, self.pos = img, (x, y)
             self.alpha = img[:, :, 3:4].astype(np.float32) / 255.0 * 0.9
         if look.progress:

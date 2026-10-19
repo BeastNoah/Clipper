@@ -70,6 +70,22 @@ def test_logo_and_progress_bar(tmp_path):
     assert (img[2, fmt.width // 2 + 2:] == 0).all()
 
 
+@pytest.mark.parametrize("ratio", ["9:16", "16:9", "1:1"])
+def test_tall_and_16_bit_logos(tmp_path, ratio):
+    import cv2
+
+    logo = np.full((1200, 100, 4), 65535, np.uint16)  # a white, fully opaque, very tall 16-bit logo
+    cv2.imwrite(str(tmp_path / "logo.png"), logo)
+    fmt = get_format(ratio)
+    for position in ("top-left", "bottom-right"):
+        ov = Overlay(Look(logo=tmp_path / "logo.png", logo_position=position), fmt)
+        img = ov.apply(np.zeros((fmt.height, fmt.width, 3), np.uint8), 0.0)  # used to crash on 16:9 and 1:1
+        x, y = ov.pos
+        h, w = ov.logo.shape[:2]
+        assert 0 <= x and x + w <= fmt.width and 0 <= y and y + h <= fmt.height
+        assert img[y + h // 2, x + w // 2].min() >= 225  # white at 90% opacity, not wrapped-around noise
+
+
 def test_formats_change_the_caption_canvas():
     words = map_words(make_words(["We tried it. And it worked!"]), 0.0, EditMap([(0.0, 10.0)]))
     sq = build_ass(words, 5, fmt=get_format("1:1"))

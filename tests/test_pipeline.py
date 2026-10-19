@@ -161,3 +161,50 @@ def test_new_clips_for_a_video_done_before(tmp_path, fake_claude):
     assert new["start"] >= first["end"] or new["end"] <= first["start"]
     assert first_mp4.stat().st_mtime_ns == mtime  # the clip made before isn't made again
     assert len(list((work / "output").glob("*.mp4"))) == 2
+
+
+def test_failed_rerender_keeps_the_clips_already_made(tmp_path, fake_claude, monkeypatch):
+    import clipper.pipeline as pipeline
+    from clipper.util import ClipperError
+
+    src = tmp_path / "talk.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=40",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=40", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    work_root = tmp_path / "work"
+
+    def args(*extra):
+        return [str(src), "--work-dir", str(work_root), "-n", "2", "--min-len", "8", "--max-len", "12",
+                "--preset", "ultrafast", "--caption-model", "none", *extra]
+
+    assert cli.main(args("--stop-after", "ingest")) == 0
+    (work,) = work_root.iterdir()
+    meta = json.loads((work / "meta.json").read_text())
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "en", "model": "small",
+                   "words": make_words([f"This is spoken sentence number {i} today." for i in range(14)], start=0.5)},
+    })
+    assert cli.main(args()) == 0
+    out = work / "output"
+    before = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert sum(name.endswith(".mp4") for name in before) == 2 and "clips.json" in before
+
+    real_render, calls = pipeline.render, []
+
+    def fails_on_second_clip(*a, **k):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ClipperError("disk full")
+        return real_render(*a, **k)
+
+    monkeypatch.setattr(pipeline, "render", fails_on_second_clip)
+    assert cli.main(args("--force", "render")) != 0
+    after = {p.name: p.read_bytes() for p in out.iterdir() if p.is_file()}
+    assert after == before  # the earlier clips and their list survive a render that didn't finish
+
+    monkeypatch.setattr(pipeline, "render", real_render)
+    assert cli.main(args("--force", "render")) == 0
+    assert not (out / ".next").exists()
+    assert sorted(p.name for p in out.iterdir()) == sorted(before)

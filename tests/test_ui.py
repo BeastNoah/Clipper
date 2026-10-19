@@ -6,6 +6,7 @@ import subprocess
 import threading
 import time
 from http.server import ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -80,7 +81,13 @@ def test_ui_api(server):
 
     status, up, _ = call(port, "PUT", "/api/upload?name=../../evil%20name.mp4", body=b"x" * 1000,
                          headers={"Content-Length": "1000"})
-    assert status == 201 and up["path"] == str(work.parent / "_uploads" / "evil_name.mp4")
+    up_path = Path(up["path"])
+    assert status == 201 and up_path.name == "evil_name.mp4" and up_path.parent.parent == work.parent / "_uploads"
+    # a second file with the same name gets its own place; the first one stays as it was
+    status, up2, _ = call(port, "PUT", "/api/upload?name=evil%20name.mp4", body=b"y" * 1000,
+                          headers={"Content-Type": "application/octet-stream"})
+    assert status == 201 and up2["path"] != up["path"]
+    assert up_path.read_bytes() == b"x" * 1000 and Path(up2["path"]).read_bytes() == b"y" * 1000
 
     # other web pages can't drive the API: wrong Host (DNS rebinding), foreign Origin, form posts
     assert call(port, "GET", "/api/videos", headers={"Host": "evil.example"})[0] == 403
@@ -196,5 +203,23 @@ def test_phone_mode_needs_the_key(tmp_path):
         assert info["url"].endswith(key) and info["svg"].startswith("<svg")
         # the computer itself still works without the key
         assert call(port, "GET", "/api/videos")[0] == 200
+    finally:
+        httpd.shutdown()
+
+
+def test_key_link_only_sets_the_real_key_as_cookie(tmp_path):
+    """A crafted ?key= must not add headers or cookies (it is trusted from this computer)."""
+    root = tmp_path / "work"
+    root.mkdir()
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), type("H", (Handler,), {"app": App(root, "realkey123")}))
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    port = httpd.server_address[1]
+    try:
+        status, _, r = call(port, "GET", "/?key=x%0d%0aSet-Cookie:%20session=evil;%20Path=/")
+        assert status == 303 and r.getheader("Location") == "/"
+        assert r.headers.get_all("Set-Cookie") is None
+        status, _, r = call(port, "GET", "/?key=realkey123")
+        assert status == 303 and r.headers.get_all("Set-Cookie") == [
+            "clipper_key=realkey123; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"]
     finally:
         httpd.shutdown()

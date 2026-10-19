@@ -269,6 +269,10 @@ def ingest(source: str, work_root: Path, force: bool = False, download_mode: str
         meta = read_json(meta_path)
         have_video = video.exists() or (meta.get("video") == "sections" and download_mode == "sections")
         if meta.get("version") == INGEST_VERSION and have_video:
+            if info is None and meta.get("local") and meta.get("source") != source:
+                # Same file (the id comes from its content) at a new place: cut the clips from there now.
+                meta["source"] = source
+                write_json(meta_path, meta)
             log(f"ingest: reusing {work}")
             return work, meta
 
