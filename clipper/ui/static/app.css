@@ -243,6 +243,25 @@ details[open] > summary::before { content: "▾ "; }
   .video-head .muted.small { overflow-wrap: anywhere; }
 }
 
+/* Trending */
+.trending-head { margin-bottom: 14px; align-items: flex-end; }
+.trending-head .check { white-space: nowrap; }
+.trend .thumb { display: block; position: relative; }
+.trend.hot { border-color: var(--accent); }
+.trend .dur { position: absolute; right: 8px; bottom: 8px; font-size: 12px; font-weight: 650; background: rgba(0, 0, 0, .75); color: #fff; padding: 1px 6px; border-radius: 6px; }
+.trend .card-body { display: grid; gap: 4px; }
+.trend .meta { margin: 0; }
+.trend .chips { margin: 2px 0; }
+.verdict { font-size: 12px; font-weight: 650; padding: 1px 8px; border-radius: 99px; background: var(--panel-2); color: var(--muted); }
+.verdict.worth-it { color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent); }
+.verdict.maybe { color: var(--warn); }
+.btn.small { padding: 5px 10px; font-size: 13px; }
+.dialog.wide { max-width: min(640px, calc(100vw - 32px)); width: 100%; }
+.creators { display: grid; gap: 10px; max-height: 55vh; overflow: auto; padding: 2px; }
+.creator { display: grid; gap: 6px; border-top: 1px solid var(--line); padding-top: 10px; }
+.creator select { width: auto; flex: none; }
+#creators-body .small.muted { text-align: left; }
+
 /* Publishing */
 .account { border-top: 1px solid var(--line); padding: 12px 0; }
 .account-keys, .publish-form form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 10px; text-align: left; }

@@ -9,6 +9,7 @@ clipper ui                                          # the web interface
 clipper "https://www.youtube.com/watch?v=..." -n 5  # or straight from the command line
 clipper ~/Movies/interview.mp4 --min-len 30 --max-len 75
 clipper "https://www.youtube.com/playlist?list=..."  # every video in a playlist
+clipper trending                                    # what the creators you clip for posted lately, best first
 clipper talk.mp4 --prompt "funny moments" --from 10:00 --to 45:00 --format 9:16,1:1
 ```
 
@@ -54,6 +55,16 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   the video. Claude only looks at moments it hasn't suggested yet; earlier suggestions and finished
   clips stay. New suggestions are marked "new" and ticked, or tick "Render them right away" to have
   them made and added to the clips you already have.
+- **Worth clipping now:** the home page lists the latest videos of the creators you clip for, best
+  first, so you don't have to hunt for something to clip. Under **Creators** you keep the list
+  (YouTube channels and Twitch channels) and mark who allows clipping: from their clipping program,
+  their channel rules or by asking them; clipper can't check that for you, and the list starts with
+  two creators that ran public, paid clipping programs when this was written. Each video gets a 0–100
+  score with its reasons: how fast it's gathering views (counts most), how fresh it is, whether it's
+  long enough to hold several good moments, and the likes it gets. Shorts, live streams and videos
+  older than two weeks are left out. "Only creators that allow clipping" hides the rest. **Make clips**
+  starts a job for that video. Listings are looked up through yt-dlp (nothing is downloaded) and
+  kept for an hour; **Refresh** looks them up again. `clipper trending` prints the same list.
 - **Render:** renders the ticked clips. Jobs run one at a time and show progress, a time
   estimate and the log; they can be cancelled.
 - **Clips:** watch and download the finished clips (switch between formats), covers and caption
@@ -189,6 +200,7 @@ are written alongside.
 ## The work folder
 
 ```
+work/creators.json     the creators you clip for (Creators in the web interface)
 work/<video_id>/
   meta.json            size, frame rate, duration, title
   video.mp4            the whole video, converted (only with --download full)

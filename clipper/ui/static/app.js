@@ -298,10 +298,132 @@ async function renderHome() {
           "zoom", "progress_bar", "posts"]))),
     ),
     h("section", { id: "jobs-section", hidden: true }, h("h2", {}, "Jobs"), h("div", { class: "jobs", id: "jobs" })),
+    h("section", { id: "trending-section" },
+      h("div", { class: "row trending-head" },
+        h("div", { class: "grow" }, h("h2", { style: "margin:0" }, "Worth clipping now"),
+          h("div", { class: "small muted" }, "The latest videos of the creators you clip for, ranked by how fast they're gathering views, how fresh they are and whether they're long enough to hold several good moments.")),
+        h("label", { class: "check" }, h("input", { type: "checkbox", id: "trending-allowed", checked: store.get("clipper.trendingAllowed", true),
+          onchange: e => { store.set("clipper.trendingAllowed", e.target.checked); renderTrending(); } }), "Only creators that allow clipping"),
+        h("button", { class: "btn ghost", onclick: showCreators }, "Creators"),
+        h("button", { class: "btn ghost", id: "trending-refresh", onclick: refreshTrending }, "Refresh")),
+      h("div", { id: "trending" }, h("div", { class: "muted" }, "Loading…"))),
     h("section", {}, h("h2", {}, "Library"), h("div", { id: "library" }, h("div", { class: "muted" }, "Loading…"))),
   ));
   renderJobs();
+  loadTrending();
   refreshLibrary();
+}
+
+// ---------------------------------------------------------------------------------------------
+// Trending: what the creators you clip for posted lately, and whether it's worth clipping
+
+const CLIPPING_LABELS = { allowed: "clipping allowed", program: "clipping program", unknown: "permission unknown", no: "no clipping" };
+const CLIPPING_OK = new Set(["allowed", "program"]);
+
+function fmtCount(n) {
+  if (n == null) return "";
+  return n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(n >= 1e4 ? 0 : 1)}k` : String(n);
+}
+
+function fmtAge(ts) {
+  if (ts == null) return "";
+  const h = Math.max(0, (Date.now() / 1000 - ts) / 3600);
+  return h < 1 ? "just now" : h < 48 ? `${Math.floor(h)}h ago` : `${Math.floor(h / 24)}d ago`;
+}
+
+let trendingTimer = null;
+async function loadTrending() {
+  clearTimeout(trendingTimer);
+  if (!$("#trending")) return;
+  try { S.trending = await api.get("/api/trending"); } catch (e) { S.trending = { error: e.message, videos: [], errors: [], creators: [] }; }
+  renderTrending();
+  if (S.trending.loading && $("#trending")) trendingTimer = setTimeout(loadTrending, 2000);
+}
+
+async function refreshTrending() {
+  const btn = $("#trending-refresh");
+  if (btn) btn.disabled = true;
+  try { S.trending = await api.post("/api/trending/refresh", {}); renderTrending(); } catch (e) { toast(e.message); }
+  if (S.trending?.loading) trendingTimer = setTimeout(loadTrending, 2000);
+}
+
+function renderTrending() {
+  const box = $("#trending"), t = S.trending;
+  if (!box || !t) return;
+  const btn = $("#trending-refresh");
+  if (btn) { btn.disabled = !!t.loading; btn.textContent = t.loading ? "Looking up…" : "Refresh"; }
+  const onlyAllowed = $("#trending-allowed")?.checked ?? true;
+  const videos = (t.videos || []).filter(v => !onlyAllowed || CLIPPING_OK.has(v.clipping));
+  const notes = [];
+  if (t.error) notes.push(h("div", { class: "error" }, t.error));
+  for (const e of t.errors || []) notes.push(h("div", { class: "small muted" }, `${e.creator}: ${e.error}`));
+  if (t.fetched) notes.push(h("div", { class: "small muted" }, `Looked up ${fmtAge(t.fetched)}` + (t.loading ? " · refreshing…" : "")));
+  if (!t.creators?.length) {
+    box.replaceChildren(h("div", { class: "panel empty" }, "No creators yet. ",
+      h("button", { class: "btn small", onclick: showCreators }, "Add the creators you clip for")));
+    return;
+  }
+  if (!videos.length) {
+    box.replaceChildren(h("div", { class: "panel empty" }, t.loading ? "Looking up the latest videos…"
+      : onlyAllowed && (t.videos || []).length ? "Nothing from creators marked as allowing clipping. Untick the filter, or mark creators under Creators."
+      : "Nothing recent from these creators."), ...notes);
+    return;
+  }
+  box.replaceChildren(h("div", { class: "grid" }, videos.map(trendingCard)), ...notes);
+}
+
+function trendingCard(v) {
+  const ok = CLIPPING_OK.has(v.clipping);
+  return h("div", { class: "card trend" + (v.verdict === "worth it" ? " hot" : "") },
+    h("a", { class: "thumb", href: v.url, target: "_blank", rel: "noopener", title: "Open on " + (v.platform === "twitch" ? "Twitch" : "YouTube"),
+      style: v.thumbnail ? `background-image:url('${v.thumbnail.replace(/'/g, "%27")}')` : "" },
+      v.duration ? h("span", { class: "dur" }, fmt(v.duration)) : null),
+    h("div", { class: "card-body" },
+      h("div", { class: "card-title", title: v.title }, v.title),
+      h("div", { class: "meta" }, h("span", { class: "score", title: "Worth-clipping score out of 100" }, v.score),
+        h("span", { class: "verdict " + v.verdict.replace(" ", "-") }, v.verdict),
+        v.views != null ? h("span", {}, `${fmtCount(v.views)} views`) : null, v.timestamp ? h("span", {}, fmtAge(v.timestamp)) : null),
+      h("div", { class: "chips" }, h("span", { class: "chip" }, v.creator),
+        h("span", { class: "chip " + (ok ? "key" : v.clipping === "no" ? "warn" : "") }, CLIPPING_LABELS[v.clipping] || v.clipping)),
+      h("div", { class: "small muted" }, (v.reasons || []).join(" · ")),
+      h("div", { class: "row", style: "gap:8px; margin-top:10px" },
+        h("button", { class: "btn primary small", onclick: () => { startJob(v.url); window.scrollTo({ top: 0, behavior: "smooth" }); } }, "Make clips"),
+        h("a", { class: "btn ghost small", href: v.url, target: "_blank", rel: "noopener" }, "Watch"))));
+}
+
+async function showCreators() {
+  const dialog = $("#creators-dialog"), body = $("#creators-body");
+  if (!dialog.open) dialog.showModal();
+  let list;
+  try { list = await api.get("/api/creators"); } catch (e) { body.replaceChildren(h("div", { class: "error" }, e.message)); return; }
+  const rows = h("div", { class: "creators" });
+  const row = c => {
+    const name = h("input", { type: "text", placeholder: "Name", value: c.name || "", "aria-label": "Creator name" });
+    const url = h("input", { type: "text", placeholder: "https://www.youtube.com/@channel or https://www.twitch.tv/channel", value: c.url || "", "aria-label": "Channel link" });
+    const clipping = h("select", { "aria-label": "Clipping permission" }, Object.entries(CLIPPING_LABELS).map(([k, label]) =>
+      h("option", { value: k, selected: (c.clipping || "unknown") === k }, label)));
+    const note = h("input", { type: "text", placeholder: "Note: where they say clips are OK, their rules…", value: c.note || "", "aria-label": "Note" });
+    const el = h("div", { class: "creator" }, h("div", { class: "row", style: "gap:8px; flex-wrap:nowrap" }, name, clipping,
+      h("button", { class: "btn ghost danger small", type: "button", onclick: () => el.remove() }, "Remove")), url, note);
+    el.collect = () => ({ name: name.value.trim(), url: url.value.trim(), clipping: clipping.value, note: note.value.trim() });
+    return el;
+  };
+  rows.replaceChildren(...list.map(row));
+  const save = async () => {
+    const creators = [...rows.children].map(el => el.collect()).filter(c => c.url);
+    try {
+      await api.post("/api/creators", { creators });
+      toast("Saved. Looking up their latest videos…");
+      dialog.close();
+      loadTrending();
+    } catch (e) { toast(e.message); }
+  };
+  body.replaceChildren(
+    h("p", { class: "small muted" }, "Creators whose videos show under “Worth clipping now”. Mark who allows clipping: from their clipping program, their channel rules, or by asking them. clipper can't check that for you."),
+    rows,
+    h("div", { class: "row", style: "gap:8px; margin-top:10px" },
+      h("button", { class: "btn small", type: "button", onclick: () => { const el = row({}); rows.append(el); el.querySelector("input").focus(); } }, "Add creator"),
+      h("button", { class: "btn primary small", type: "button", onclick: save }, "Save")));
 }
 
 const STATUS = { ingested: "Downloaded", transcribed: "Transcribed", selected: "Ready to review", rendered: "Clips ready" };
@@ -972,6 +1094,7 @@ async function showPhone() {
 (async function init() {
   $("#phone-btn").addEventListener("click", showPhone);
   $("#accounts-btn").addEventListener("click", showAccounts);
+  $("#creators-btn").addEventListener("click", showCreators);
   window.addEventListener("focus", () => { if ($("#accounts-dialog").open) showAccounts(); });  // back from signing in
   S.choices = await api.get("/api/choices");
   window.addEventListener("hashchange", route);

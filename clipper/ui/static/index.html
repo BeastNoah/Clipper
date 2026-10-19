@@ -16,12 +16,18 @@
       <a href="#/" data-nav="home">Library</a>
     </nav>
     <div id="jobs-pill" class="jobs-pill" hidden></div>
+    <button id="creators-btn" class="btn ghost phone-btn" type="button">Creators</button>
     <button id="accounts-btn" class="btn ghost phone-btn" type="button">Accounts</button>
     <button id="phone-btn" class="btn ghost phone-btn" type="button">Phone</button>
   </header>
   <dialog id="accounts-dialog" class="dialog" aria-labelledby="accounts-title">
     <h2 id="accounts-title">Accounts for publishing</h2>
     <div id="accounts-body"></div>
+    <form method="dialog"><button class="btn">Close</button></form>
+  </dialog>
+  <dialog id="creators-dialog" class="dialog wide" aria-labelledby="creators-title">
+    <h2 id="creators-title">Creators you clip for</h2>
+    <div id="creators-body"></div>
     <form method="dialog"><button class="btn">Close</button></form>
   </dialog>
   <dialog id="phone-dialog" class="dialog" aria-labelledby="phone-title">

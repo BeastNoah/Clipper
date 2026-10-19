@@ -45,6 +45,7 @@ from ..pipeline import (
 from ..reframe import LAYOUTS
 from ..render import ENCODERS
 from ..select import split_sentences
+from ..trending import TrendingLoader, load_creators, save_creators
 from ..util import Cancelled, ClipperError, read_json, set_reporter
 
 STATIC = Path(__file__).with_name("static")
@@ -440,6 +441,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(frame_jpeg(work, max(0.0, t)), cache=True)
         if route == ["accounts"]:
             return self._json(pub.status())
+        if route == ["trending"]:
+            return self._json(self.app.trending.state())
+        if route == ["creators"]:
+            return self._json(load_creators(self.app.root))
         if len(route) == 3 and route[0] == "accounts" and route[2] == "options":
             try:  # fetched every time the publish form opens (TikTok requires current creator info)
                 return self._json(pub.options(route[1]))
@@ -498,6 +503,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(job.public(), 201)
         if len(parts) == 4 and parts[:2] == ["api", "accounts"]:
             return self._account_action(parts[2], parts[3])
+        if parts == ["api", "trending", "refresh"]:
+            self.app.trending.start(refresh=True)
+            return self._json(self.app.trending.state())
+        if parts == ["api", "creators"]:
+            try:
+                creators = save_creators(self.app.root, self._body().get("creators"))
+            except ClipperError as e:
+                return self._error(400, str(e))
+            self.app.trending.start()  # the list changed: look the new creators up
+            return self._json(creators)
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
             job = self.app.find_job(parts[2])
             if not job:
@@ -608,6 +623,7 @@ class App:
         self.uploads = JobManager()  # posting runs on its own queue, so it never waits behind a render
         self.logins = pub.Logins()
         self.key, self.phone_url = key, phone_url
+        self.trending = TrendingLoader(root)
 
     def make_job(self, body: dict) -> Job:
         opts = Options.from_dict({**body.get("options", {}), "work_dir": str(self.root)})

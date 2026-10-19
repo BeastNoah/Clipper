@@ -17,6 +17,7 @@ from .util import ClipperError, fmt_time, log
 USAGE = """\
 clipper SOURCE [SOURCE ...] [options]   make clips from files, URLs or playlists
 clipper ui [--port N] [--work-dir DIR]   open the web interface
+clipper trending [--refresh] [--all]     what the creators you clip for posted lately, best first
 clipper doctor                           check that everything clipper needs is installed"""
 
 
@@ -142,6 +143,31 @@ def run_sources(args: argparse.Namespace) -> int:
     return 0
 
 
+def show_trending(argv: list[str]) -> int:
+    """`clipper trending`: the creators' latest videos ranked by how much they're worth clipping."""
+    from .trending import CLIPPING_LABELS, creators_path, load_creators, trending
+
+    p = argparse.ArgumentParser(prog="clipper trending")
+    p.add_argument("--work-dir", default="work", help="where results are kept (default ./work)")
+    p.add_argument("--refresh", action="store_true", help="look the creators up again instead of using the last hour's result")
+    p.add_argument("--all", action="store_true", help="also show creators not marked as allowing clipping")
+    args = p.parse_args(argv)
+    root = Path(args.work_dir).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    data = trending(root, refresh=args.refresh)
+    videos = [v for v in data["videos"] if args.all or v["clipping"] in ("allowed", "program")]
+    for e in data["errors"]:
+        log(f"{e['creator']}: {e['error']}")
+    if not videos:
+        print(f"Nothing to show. Add creators in the web interface (Creators) or in {creators_path(root)}"
+              + ("" if args.all else ", or use --all to include creators not marked as allowing clipping") + ".")
+        return 0
+    for v in videos:
+        print(f"[{v['score']:3d}] {v['verdict']:<8} {v['creator']} ({CLIPPING_LABELS[v['clipping']]})\n"
+              f"      {v['title']}\n      {' · '.join(v['reasons'])}\n      {v['url']}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -151,6 +177,8 @@ def main(argv: list[str] | None = None) -> int:
         if argv[:1] == ["ui"]:
             from .ui.server import serve
             return serve(argv[1:])
+        if argv[:1] == ["trending"]:
+            return show_trending(argv[1:])
         return run_sources(parse_args(argv))
     except ClipperError as e:
         print(f"clipper: error: {e}", file=sys.stderr)
