@@ -39,6 +39,13 @@ folder, your `work` folder and your terminal's PATH (so it finds ffmpeg and clau
 `clipper app` again if you move the folder. `clipper app --phone` makes it open the interface for
 your phone too. If it can't start, it shows why; the full log is in `work/.ui.log`.
 
+The app also keeps clipper up to date: each time you open it, it pulls the newest version from
+GitHub into this folder first (and reinstalls when the dependencies changed). If that brought new
+code and the interface is already running but idle, it is restarted so the new code takes effect;
+while clips are being made it is left alone and the new version starts next time. Without a
+network connection, or with local changes in this folder, the version already here is used. What
+happened is in `work/.update.log`. `clipper app --no-update` makes an app that never pulls.
+
 If captions fail with "built without libass", install a full ffmpeg build (`brew install
 ffmpeg-full`). On first use clipper downloads the Whisper models (about 500 MB for `small`, the
 transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet face model
