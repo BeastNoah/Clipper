@@ -1,4 +1,4 @@
-"""Command line: `clipper SOURCE...`, `clipper ui` and `clipper doctor`."""
+"""Command line: `clipper SOURCE...`, `clipper ui`, `clipper app` and `clipper doctor`."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ USAGE = """\
 clipper SOURCE [SOURCE ...] [options]   make clips from files, URLs or playlists
 clipper ui [--port N] [--work-dir DIR]   open the web interface
 clipper trending [--refresh] [--all]     what the creators you clip for posted lately, best first
+clipper app                              make a Clipper.app (macOS) that opens the interface
 clipper doctor                           check that everything clipper needs is installed"""
 
 
@@ -179,6 +180,9 @@ def main(argv: list[str] | None = None) -> int:
             return serve(argv[1:])
         if argv[:1] == ["trending"]:
             return show_trending(argv[1:])
+        if argv[:1] == ["app"]:
+            from .app import make_app
+            return make_app(argv[1:])
         return run_sources(parse_args(argv))
     except ClipperError as e:
         print(f"clipper: error: {e}", file=sys.stderr)

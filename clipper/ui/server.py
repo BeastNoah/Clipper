@@ -786,6 +786,8 @@ def serve(argv: list[str]) -> int:
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
     print(f"clipper ui running at {url}  (work folder: {root})  Press Ctrl+C to stop.")
+    url_file = root / ".ui-url"  # lets Clipper.app (`clipper app`) find a running interface
+    url_file.write_text(url)
     if args.phone:
         app.key = phone_key(root, args.new_key)
         ip = lan_ip()
@@ -807,4 +809,9 @@ def serve(argv: list[str]) -> int:
         pass
     finally:
         server.server_close()
+        try:
+            if url_file.read_text() == url:  # another clipper ui may have taken over the folder since
+                url_file.unlink()
+        except OSError:
+            pass
     return 0
