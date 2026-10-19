@@ -15,6 +15,7 @@ from .audio import Loudness
 from .captions import PRESETS, Watermark, _phrases, build_srt, keyword_positions, make_captions, make_style, map_words
 from .edit import MODES as JUMP_CUT_MODES
 from .edit import EditMap, plan_cuts
+from .edits import ClipEdits, apply_cuts, load_edits
 from .formats import Format, get_format, parse_formats, parse_time
 from .ingest import DOWNLOAD_MODES, clip_video, ingest
 from .llm import Claude
@@ -170,11 +171,15 @@ def parts_of(clip: dict) -> list[dict]:
     return [{**single, **part} for part in clip_parts(clip)]
 
 
-def zoom_windows(words: list[dict], keywords: list[str], duration: float) -> list[tuple[float, float]]:
-    """When to punch in: on the opening line (the hook) and on each of Claude's keywords."""
-    windows = [(0.0, min(1.4, duration))]
-    for i in sorted(keyword_positions(words, keywords)):
-        windows.append((max(0.0, words[i]["s"] - 0.05), min(duration, words[i]["e"] + 1.0)))
+def zoom_windows(words: list[dict], keywords: list[str], duration: float,
+                 extra: list[tuple[float, float]] = (), auto: bool = True) -> list[tuple[float, float]]:
+    """When to punch in: on the opening line (the hook) and on each of the keywords, plus any windows you
+    added yourself (output time)."""
+    windows = [(0.0, min(1.4, duration))] if auto else []
+    if auto:
+        for i in sorted(keyword_positions(words, keywords)):
+            windows.append((max(0.0, words[i]["s"] - 0.05), min(duration, words[i]["e"] + 1.0)))
+    windows += [(max(0.0, a), min(duration, b)) for a, b in extra if min(duration, b) - max(0.0, a) > 0.1]
     merged: list[tuple[float, float]] = []
     for a, b in sorted(windows):
         if merged and a - merged[-1][1] < 1.0:
@@ -205,18 +210,21 @@ def edited_words(work: Path, clip: dict) -> list[dict] | None:
     return None
 
 
+def part_words(work: Path, part: dict) -> list[dict]:
+    """The transcribed words of one part of a clip: the clip's own transcription where there is one, else the
+    video's transcript."""
+    path = clip_dir_for(work, part) / "words.json"
+    if path.exists():
+        return read_json(path)["result"]
+    transcript = read_json(work / "transcript.json")["result"]
+    return words_in(transcript["words"], part["start"], part["end"])
+
+
 def caption_lines(work: Path, clip: dict) -> list[dict]:
     """The clip's words as editable sentences (source times), in playing order."""
     words = edited_words(work, clip)
     if words is None:
-        words = []
-        for part in parts_of(clip):
-            path = clip_dir_for(work, part) / "words.json"
-            if path.exists():
-                words += read_json(path)["result"]
-            else:
-                transcript = read_json(work / "transcript.json")["result"]
-                words += words_in(transcript["words"], part["start"], part["end"])
+        words = [w for part in parts_of(clip) for w in part_words(work, part)]
     words = [{**w, "w": w["w"].strip()} for w in words if w["w"].strip()]
     at = lambda t: round(play_time(clip, t), 2)  # noqa: E731
     return [{"start": p[0]["s"], "end": p[-1]["e"], "at": at(p[0]["s"]), "until": at(p[-1]["e"]),
@@ -250,7 +258,21 @@ def save_caption_lines(work: Path, clip: dict, lines: list[dict]) -> None:
         words += spread(float(line["start"]), float(line["end"]), str(line["text"]))
     if not words:
         raise ClipperError("The captions can't be empty.")
+    # A part the lines don't cover (a section just added in the editor) keeps its transcribed words.
+    for part in parts_of(clip):
+        if not any(part["start"] <= w["s"] < part["end"] for w in words):
+            words += [{"w": w["w"].strip(), "s": w["s"], "e": w["e"]} for w in part_words(work, part) if w["w"].strip()]
+    words.sort(key=lambda w: w["s"])
     write_json(_edits_path(work, clip), {"span": _edits_span(clip), "words": words})
+
+
+def apply_title(clip: dict, ed: ClipEdits) -> None:
+    """Your own title replaces Claude's on the clip; Claude's is kept so clearing yours brings it back."""
+    if ed.title:
+        clip.setdefault("claude_title", clip["title"])
+        clip["title"] = ed.title
+    elif clip.get("claude_title"):
+        clip["title"] = clip.pop("claude_title")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -274,7 +296,10 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
     formats = [get_format(n) for n in opts.formats]
     logo_shape = read_logo(Path(opts.logo).expanduser()).shape if opts.logo and opts.watermark else None
     fps = float(Fraction(meta["fps"]))
-    loud = Loudness.from_work(work) if opts.jump_cuts != "off" else None
+    # Your own changes from the editor, per clip: they ride on top of what Claude and clipper proposed.
+    edits = {c["id"]: load_edits(work, c) for c in clips}
+    loud = Loudness.from_work(work) if any((edits[c["id"]].jump_cuts or opts.jump_cuts) != "off"
+                                           for c in clips) else None
     claude = claude_factory(opts, work)
     out_dir = work / "output"
     out_dir.mkdir(exist_ok=True)
@@ -293,6 +318,10 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
         for clip in clips:
             check_cancel()
             report("step", f"clip {clip['rank']} of {len(clips)}")
+            ed = edits[clip["id"]]
+            apply_title(clip, ed)
+            jump_cuts, layout = ed.jump_cuts or opts.jump_cuts, ed.layout or opts.layout
+            keywords = list(ed.keywords) if ed.keywords is not None else list(clip.get("keywords") or [])
             cdir = clip_dir_for(work, clip)
             cdir.mkdir(parents=True, exist_ok=True)
             parts = parts_of(clip)
@@ -311,8 +340,12 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                 if (clip["rank"], n) in fetches:
                     fetches[clip["rank"], n].result()  # this part's section, fetched in the background
                 src = clip_video(work, meta, part, pdir)
-                edit = EditMap(plan_cuts(words, part["start"], part["end"], fps, opts.jump_cuts,
-                                         loud.is_quiet if loud else None))
+                keep = plan_cuts(words, part["start"], part["end"], fps, jump_cuts, loud.is_quiet if loud else None)
+                if ed.cuts_removed or ed.cuts_kept:
+                    keep = apply_cuts(keep, ed.in_part(ed.cuts_removed, part["start"], part["end"]),
+                                      ed.in_part(ed.cuts_kept, part["start"], part["end"]),
+                                      part["end"] - part["start"], fps)
+                edit = EditMap(keep)
                 pieces.append((part, pdir, words, src, edit))
                 timeline += [[round(part["start"] + a, 3), round(part["start"] + b, 3), round(offset + o, 3)]
                              for (a, b), o in zip(edit.segments, edit.offsets)]
@@ -320,15 +353,25 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                            for w in map_words(words, part["start"], edit)]
                 offset += edit.duration
             duration = offset
-            cap_words, cap_title, keywords = spoken, clip["title"], clip.get("keywords")
-            if opts.caption_language:
-                cap_words, cap_title = translate_clip(cdir, spoken, clip["title"], opts.caption_language, claude)
-                keywords = None  # the keywords were picked in the spoken language
-            look = Look(zoom=zoom_windows(spoken, clip.get("keywords") or [], duration) if opts.zoom else [],
-                        logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
-                        opacity=opts.watermark_opacity, progress=style.highlight if opts.progress_bar else None)
             clip["final_duration"] = round(duration, 2)
             clip["timeline"] = timeline
+            clip["edited"] = not ed.is_empty
+            to_out = lambda t: play_time(clip, t)  # noqa: E731 - video time -> time in the finished clip
+            cap_words, cap_title, cap_keywords = spoken, clip["title"], keywords
+            if opts.caption_language:
+                cap_words, cap_title = translate_clip(cdir, spoken, clip["title"], opts.caption_language, claude)
+                cap_keywords = None  # the keywords were picked in the spoken language
+            show_title = opts.title_overlay if ed.title_overlay is None else ed.title_overlay
+            texts = [{**t, "start": to_out(t["start"]), "end": to_out(t["end"])} for t in ed.texts]
+            look = Look(zoom=zoom_windows(spoken, keywords, duration, [(to_out(a), to_out(b)) for a, b in ed.zooms],
+                                          auto=opts.zoom and ed.zoom != "off"),
+                        logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
+                        opacity=opts.watermark_opacity, progress=style.highlight if opts.progress_bar else None,
+                        broll=[(to_out(b["start"]), to_out(b["end"]), Path(b["file"]).expanduser()) for b in ed.broll
+                               if to_out(b["end"]) - to_out(b["start"]) > 0.1],
+                        fade_between=0.3 if ed.transition == "fade" and len(parts) > 1 else 0.0,
+                        fade_in=0.4 if ed.fade_in else 0.0, fade_out=0.5 if ed.fade_out else 0.0,
+                        music=(Path(ed.music["file"]).expanduser(), ed.music["volume"]) if ed.music else None)
             base = f"{clip['rank']:02d}_{slugify(clip['title'])}"
             outputs = {}
             for n, fmt in enumerate(formats):
@@ -337,12 +380,13 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                 plans = []
                 for part, pdir, words, src, edit in pieces:
                     (pdir / fmt.tag).mkdir(exist_ok=True)
-                    plan = reframe(work, meta, part, pdir / fmt.tag, words, opts.layout,
-                                   force=opts.forced("reframe"), src=src, fmt=fmt)
+                    plan = reframe(work, meta, part, pdir / fmt.tag, words, layout,
+                                   force=opts.forced("reframe"), src=src, fmt=fmt,
+                                   layouts=ed.layouts_in_part(part["start"], part["end"]))
                     plans.append(Piece(src, part["start"], part["end"], plan, edit))
                 ass = make_captions(cap_words, duration, fdir, style, fmt,
-                                    title=cap_title if opts.title_overlay else None, cover_title=cap_title,
-                                    keywords=keywords, watermark=watermark_for(opts, fmt, logo_shape))
+                                    title=cap_title if show_title else None, cover_title=cap_title,
+                                    keywords=cap_keywords, watermark=watermark_for(opts, fmt, logo_shape), texts=texts)
                 if not do_render:
                     continue
                 mp4 = render(work, meta, clip, plans, ass, fdir, fmt=fmt, look=look, encoder=opts.encoder,
@@ -480,7 +524,7 @@ def rerender(work: Path, opts: Options) -> list[dict]:
     path = work / "output" / "clips.json"
     if not path.exists():
         raise ClipperError("There are no rendered clips to update.")
-    keep = ("rank", "id", "title", "hook", "type", "score", "scores", "start", "end", "duration", "si", "ei",
-            "text", "keywords", "before")
+    keep = ("rank", "id", "title", "claude_title", "hook", "type", "score", "scores", "start", "end", "duration",
+            "si", "ei", "text", "keywords", "before")
     clips = [{k: c[k] for k in keep if k in c} for c in read_json(path)]
     return produce(work, meta, transcript, clips, opts)

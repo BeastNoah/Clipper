@@ -121,6 +121,12 @@ if '<clip id="' in prompt:
         trims.append({"id": tid, "first": first, "last": last})
     reply({"trims": trims})
 
+if "<clip_text>" in prompt:  # other titles to open a clip with (the editor's "AI hook")
+    current = re.search(r'opens with the title "(.*?)"', prompt)[1]
+    reply({"hooks": [{"title": f"Why {current} matters", "why": "a question"},
+                     {"title": f"{current}, explained", "why": "a promise"},
+                     {"title": "The part nobody tells you", "why": "curiosity"}]})
+
 if resume:  # a correction request after a bad first answer: the original prompt isn't resent
     reply({"clips": []})
 
