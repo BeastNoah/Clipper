@@ -85,7 +85,10 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   estimate and the log; they can be cancelled.
 - **Clips:** watch and download the finished clips (switch between formats), covers and caption
   files, and copy the post text for TikTok, Instagram or YouTube. **Fix captions** lets you correct
-  misheard words; the clip is then rendered again with your text.
+  misheard words: the lines sit next to the clip's player, the line being spoken is highlighted as
+  it plays, and clicking a line's time (or Ctrl+Enter while typing in it) plays just that line, so
+  you can read along and catch mistakes. Changed lines are marked; on saving, the clip is rendered
+  again with your text.
 
 ### On your phone
 

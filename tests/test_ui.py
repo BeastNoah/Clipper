@@ -121,6 +121,10 @@ def test_ui_api(server):
     status, caps, _ = call(port, "GET", f"/api/videos/{vid}/captions/1")
     assert status == 200 and not caps["edited"] and caps["lines"][0]["text"].startswith("This is spoken")
     lines = caps["lines"]
+    # each line says where it plays in the finished clip, in order and within its length
+    clip_len = call(port, "GET", f"/api/videos/{vid}")[1]["rendered"][0]["final_duration"]
+    assert all(0 <= l["at"] <= l["until"] <= clip_len + 0.01 for l in lines)
+    assert [l["at"] for l in lines] == sorted(l["at"] for l in lines)
     lines[0]["text"] = lines[0]["text"].replace("spoken", "Spoken-Word")
     status, job, _ = call(port, "POST", f"/api/videos/{vid}/captions/1",
                           {"lines": lines, "options": {"caption_model": "none", "preset": "ultrafast"}})

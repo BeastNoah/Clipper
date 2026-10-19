@@ -177,7 +177,12 @@ def caption_lines(work: Path, clip: dict) -> list[dict]:
             transcript = read_json(work / "transcript.json")["result"]
             words = [w for w in transcript["words"] if clip["start"] <= (w["s"] + w["e"]) / 2 < clip["end"]]
     words = [{**w, "w": w["w"].strip()} for w in words if w["w"].strip()]
-    return [{"start": p[0]["s"], "end": p[-1]["e"], "text": " ".join(w["w"] for w in p)} for p in _phrases(words)]
+    # "at"/"until": where the line plays in the finished clip, after the jump cuts (to follow along in the player).
+    # Clips rendered before the cuts were kept get the time from the clip's start, which is close enough.
+    edit = EditMap([tuple(s) for s in clip["segments"]]) if clip.get("segments") else None
+    at = lambda t: edit.to_output(t - clip["start"]) if edit else max(0.0, t - clip["start"])  # noqa: E731
+    return [{"start": p[0]["s"], "end": p[-1]["e"], "at": round(at(p[0]["s"]), 2), "until": round(at(p[-1]["e"]), 2),
+             "text": " ".join(w["w"] for w in p)} for p in _phrases(words)]
 
 
 def save_caption_lines(work: Path, clip: dict, lines: list[dict]) -> None:
@@ -250,6 +255,7 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
                         logo=Path(opts.logo).expanduser() if opts.logo else None, logo_position=opts.logo_position,
                         progress=style.highlight if opts.progress_bar else None)
             clip["final_duration"] = round(edit.duration, 2)
+            clip["segments"] = [[round(a, 3), round(b, 3)] for a, b in edit.segments]
             base = f"{clip['rank']:02d}_{slugify(clip['title'])}"
             outputs = {}
             for n, fmt in enumerate(formats):

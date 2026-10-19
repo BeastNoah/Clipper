@@ -836,7 +836,7 @@ function clipCard(v, c) {
     h("div", { class: "row", style: "gap:8px" }, download, coverLink,
       ...(c.srt || []).map(f => h("a", { class: "btn ghost", href: media(f), download: f, title: "Caption file" },
         f.split(".").length > 2 ? `Captions (${f.split(".").slice(-2, -1)[0]})` : "Captions")),
-      h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor) }, "Fix captions"),
+      h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor, player) }, "Fix captions"),
       h("button", { class: "btn", onclick: () => openPublish(v, c, publishBox) }, "Publish")),
     posted.length ? h("div", { class: "posted-list" }, posted.map(([name, r]) =>
       r.url ? h("a", { class: "posted", href: r.url, target: "_blank", rel: "noopener" }, `Posted to ${PLATFORM_NAMES[name]}`)
@@ -850,29 +850,77 @@ function clipCard(v, c) {
   return card;
 }
 
-async function openCaptionEditor(v, c, box) {
-  if (!box.hidden) { box.hidden = true; return; }
+async function openCaptionEditor(v, c, box, player) {
+  const card = box.closest(".clip-card");
+  const close = () => { box.hidden = true; card?.classList.remove("editing"); box.stopFollowing?.(); };
+  if (!box.hidden) { close(); return; }
   box.hidden = false;
+  card?.classList.add("editing");
   box.replaceChildren(h("div", { class: "small muted" }, "Loading…"));
   let data;
   try { data = await api.get(`/api/videos/${v.id}/captions/${c.rank}`); }
   catch (e) { box.replaceChildren(h("div", { class: "error" }, e.message)); return; }
-  const inputs = data.lines.map(l => h("textarea", { rows: 2, "aria-label": `Caption at ${fmt(l.start)}` }, l.text));
+  const lines = data.lines;
+  const at = i => lines[i].at, until = i => lines[i].until;  // where each line plays in the clip (after jump cuts)
+  let stopAt = null, ownSeek = false;  // "play this line" stops at the line's end, unless you seek elsewhere
+  const play = i => {
+    ownSeek = true;
+    player.currentTime = at(i) + 0.01;
+    stopAt = until(i) + 0.15;
+    player.play().catch(() => {});
+  };
+  const save = h("button", { class: "btn primary" }, "Save and update");
+  const changed = () => lines.filter((l, i) => inputs[i].value.trim() !== l.text).length;
+  const refresh = () => {
+    rows.forEach((r, i) => r.classList.toggle("changed", inputs[i].value.trim() !== lines[i].text));
+    const n = changed();
+    save.textContent = n ? `Save and update (${n} changed)` : "Save and update";
+  };
+  const inputs = lines.map((l, i) => h("textarea", { rows: 2, "aria-label": `Caption at ${fmt(at(i))}`, spellcheck: "true",
+    oninput: refresh, onfocus: () => { if (player.paused) player.currentTime = at(i) + 0.01; },
+    onkeydown: e => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); play(i); } } }, l.text));
+  const rows = lines.map((l, i) => h("div", { class: "caption-line" },
+    h("button", { class: "t", title: "Play this line", "aria-label": `Play the line at ${fmt(at(i))}`, onclick: () => play(i) }, `▶ ${fmt(at(i))}`),
+    inputs[i]));
+
+  // While the clip plays, the line being spoken is highlighted (and kept in view unless you're typing).
+  const follow = new AbortController();
+  box.stopFollowing = () => follow.abort();
+  let current = -1;
+  player.addEventListener("timeupdate", () => {
+    const t = player.currentTime;
+    if (stopAt != null && t >= stopAt) { player.pause(); stopAt = null; }
+    let i = -1;
+    for (let j = 0; j < lines.length && at(j) <= t + 0.05; j++) i = j;
+    if (i === current) return;
+    rows[current]?.classList.remove("playing");
+    current = i;
+    if (i < 0) return;
+    rows[i].classList.add("playing");
+    if (!inputs.includes(document.activeElement)) rows[i].scrollIntoView({ block: "nearest" });
+  }, { signal: follow.signal });
+  player.addEventListener("seeking", () => { if (!ownSeek) stopAt = null; ownSeek = false; }, { signal: follow.signal });
+
   const send = async body => {
     try {
       await api.post(`/api/videos/${v.id}/captions/${c.rank}`, { ...body, options: options() });
-      box.hidden = true;
+      close();
       toast("Saved. Updating the clips…");
       pollJobs();
     } catch (e) { toast(e.message); }
   };
+  save.addEventListener("click", () => {
+    if (!changed() && !data.edited) { toast("Nothing changed"); return; }
+    send({ lines: lines.map((l, i) => ({ ...l, text: inputs[i].value })) });
+  });
   box.replaceChildren(
-    h("div", { class: "small muted" }, "Correct any misheard words, then save. The clips are rendered again with your text."),
-    ...data.lines.map((l, i) => h("label", { class: "caption-line" }, h("span", { class: "t" }, fmt(l.start)), inputs[i])),
+    h("div", { class: "small muted" }, "Play the clip and read along: the line being spoken is highlighted. ",
+      "Click a time to hear just that line (or press Ctrl+Enter while typing). Fix any misheard words, then save; the clip is rendered again with your text."),
+    h("div", { class: "caption-lines" }, rows),
     h("div", { class: "row", style: "gap:8px; margin-top:8px" },
-      h("button", { class: "btn primary", onclick: () => send({ lines: data.lines.map((l, i) => ({ ...l, text: inputs[i].value })) }) }, "Save and update"),
+      save,
       data.edited ? h("button", { class: "btn ghost", onclick: () => send({ reset: true }) }, "Undo my corrections") : null,
-      h("button", { class: "btn ghost", onclick: () => { box.hidden = true; } }, "Cancel")));
+      h("button", { class: "btn ghost", onclick: close }, "Cancel")));
 }
 
 // ---------------------------------------------------------------------------------------------

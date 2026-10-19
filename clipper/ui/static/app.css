@@ -208,8 +208,20 @@ details[open] > summary::before { content: "▾ "; }
 .clip-card { padding: 14px; }
 .vertical { width: 100%; aspect-ratio: 9 / 16; background: #000; border-radius: 12px; display: block; }
 .caption-editor { margin-top: 12px; display: grid; gap: 8px; }
-.caption-line { display: grid; grid-template-columns: 44px 1fr; gap: 8px; align-items: start; }
-.caption-line .t { color: var(--muted); font-size: 12px; padding-top: 9px; font-variant-numeric: tabular-nums; }
+.caption-lines { display: grid; gap: 6px; max-height: 55vh; overflow-y: auto; padding: 2px; }
+.caption-line { display: grid; grid-template-columns: 58px 1fr; gap: 8px; align-items: start; border-radius: 10px; padding: 3px; }
+.caption-line .t { color: var(--muted); font-size: 12px; padding: 8px 4px; font-variant-numeric: tabular-nums; background: none; border: 0; cursor: pointer; text-align: left; border-radius: 6px; }
+.caption-line .t:hover { color: var(--text); }
+.caption-line.playing { background: var(--accent-soft); }
+.caption-line.playing .t { color: var(--text); font-weight: 650; }
+.caption-line.changed textarea { border-color: var(--accent); }
+/* While fixing captions the card takes the whole row: the player on the left stays in view, the lines on the right. */
+@media (min-width: 760px) {
+  .clip-card.editing { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(240px, 320px) 1fr; column-gap: 24px; align-items: start; }
+  .clip-card.editing > * { grid-column: 2; }
+  .clip-card.editing > video { grid-column: 1; grid-row: 1 / span 12; position: sticky; top: 16px; }
+  .clip-card.editing .caption-lines { max-height: 70vh; }
+}
 .caption-line textarea { width: 100%; resize: vertical; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; font-size: 14px; }
 #focus, .find-focus { font-size: 15px; }
 .find { display: grid; gap: 12px; margin-bottom: 12px; }
