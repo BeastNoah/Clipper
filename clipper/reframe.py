@@ -69,6 +69,16 @@ class FaceDetector:
     the download isn't possible."""
 
     _warned = False
+    _unavailable = False  # the YuNet download failed once already; don't wait for it again
+
+    @classmethod
+    def kind_available(cls) -> str:
+        """Which detector a new FaceDetector will use (part of the reframe cache key)."""
+        import cv2
+
+        if cls._yunet_model() is not None:
+            return "yunet"
+        return "haar" if hasattr(cv2, "CascadeClassifier") else "none"
 
     def __init__(self, width: int, height: int):
         import cv2
@@ -91,6 +101,8 @@ class FaceDetector:
         path = _model_cache_dir() / "face_detection_yunet_2023mar.onnx"
         if path.exists():
             return path
+        if cls._unavailable:
+            return None
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_suffix(".part")
@@ -99,6 +111,7 @@ class FaceDetector:
             os.replace(tmp, path)
             return path
         except Exception as e:  # noqa: BLE001 - any failure just means the fallback detector
+            cls._unavailable = True
             if not cls._warned:
                 log(f"reframe: couldn't download the YuNet face model ({e}); using OpenCV's Haar detector")
                 cls._warned = True
@@ -354,7 +367,10 @@ def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: 
         return "follow", follow, info
 
     hc = min(H, max(_even(0.4 * H), _even(3.5 * max(_median(left, 3), _median(right, 3)))))
-    wc = min(W, _even(hc * fmt.width / (fmt.height / 2)))
+    wc = _even(hc * fmt.width / (fmt.height / 2))
+    if wc > W:  # a narrow source (square, 4:3) with big faces: keep each half's shape, don't stretch it
+        wc = W
+        hc = int(W * (fmt.height / 2) / fmt.width) // 2 * 2
     xs = [camera_path(frames, centers(t), a, b - 1, W, wc, fps) for t in (left, right)]
     ys = [int(min(max(_median(t, 1) - 0.42 * hc, 0), H - hc)) for t in (left, right)]
     split = [[xl, ys[0], xr, ys[1], hc] for xl, xr in zip(*xs)]
@@ -437,7 +453,8 @@ def reframe(work: Path, meta: dict, clip: dict, out_dir: Path, words: list[dict]
     src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
     speech = [[round(w["s"], 2), round(w["e"], 2)] for w in words or []]
     params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"], "layout": layout,
-              "speech": fingerprint(speech), "video": src.key(), "format": fmt.name}
+              "speech": fingerprint(speech), "video": src.key(), "format": fmt.name,
+              "detector": FaceDetector.kind_available()}  # a result from the Haar fallback isn't kept for good
     # The file may be a section of the video: work in its own time, which starts at src.offset.
     local = [{**w, "s": w["s"] - src.offset, "e": w["e"] - src.offset} for w in words or []]
     dims = {"width": src.width, "height": src.height, "fps": src.fps}

@@ -496,7 +496,8 @@ class Selector:
         params = {"version": SELECT_VERSION, "transcript": fingerprint(words), "min_len": min_len,
                   "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks],
                   "focus": self.focus}
-        old = read_json(self.path) if self.path.exists() and not force else None
+        previous = read_json(self.path) if self.path.exists() else None
+        old = previous if not force else None
         if old and {k: old["params"].get(k) for k in ("version", "transcript")} != \
                 {k: params[k] for k in ("version", "transcript")}:
             old = None  # suggestions for another transcript don't line up with this one's sentences
@@ -513,6 +514,13 @@ class Selector:
         for key, default in (("search", 1), ("earlier", []), ("avoid", [])):
             state.setdefault(key, default)
         self.state = state
+        # Ids already handed out, also by searches thrown away (--force) and for clips already rendered:
+        # a new suggestion must never share an id with them (the review screen and posts go by id).
+        rendered = work / "output" / "clips.json"
+        previous = previous or {}
+        self._taken = {c.get("id") for c in previous.get("earlier", []) + previous.get("candidates", [])}
+        self._taken |= {c.get("id") for c in (read_json(rendered) if rendered.exists() else [])}
+        self._taken |= {c["id"] for c in state["earlier"] + state["candidates"]}
 
     @property
     def claude(self) -> Claude:
@@ -542,8 +550,12 @@ class Selector:
         si, ei = fitted
         text = self.tl.text(si, ei)
         cands = self.state["candidates"]
+        n = len(self.state["earlier"]) + len(cands) + 1
+        while f"c{n}" in self._taken:
+            n += 1
+        self._taken.add(f"c{n}")
         cands.append({
-            "id": f"c{len(self.state['earlier']) + len(cands) + 1}",  # unique across searches
+            "id": f"c{n}",  # unique across searches
             "call": call,
             "search": self.state["search"],
             "focus": self.focus,
@@ -618,17 +630,29 @@ class Selector:
 
         # The parts of a long video are asked about at the same time; the answers are taken in order,
         # so each part's trims and its place in select.json are the same as when asked one by one.
+        # If one part fails, the answers for the others are still kept, so a new run only asks again
+        # about the part that failed.
         pool = thread_pool(min(CLAUDE_AT_ONCE, len(jobs)))
+        failed: ClipperError | None = None
         try:
             futures = [pool.submit(ask, job) for job in jobs]
             for (k, call, count, _), future in zip(jobs, futures):
-                for p in future.result()[:count]:
+                try:
+                    proposals = future.result()
+                except Cancelled:
+                    raise
+                except ClipperError as e:
+                    failed = failed or e
+                    continue
+                for p in proposals[:count]:
                     self._add(p, call)
                 self._trim()
                 self.state["done"].append(call)
                 self._save()
         finally:
             pool.shutdown(cancel_futures=True)
+        if failed:
+            raise failed
 
     def _rescore(self) -> None:
         cands = self.state["candidates"]

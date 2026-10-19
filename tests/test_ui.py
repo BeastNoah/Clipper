@@ -223,3 +223,53 @@ def test_key_link_only_sets_the_real_key_as_cookie(tmp_path):
             "clipper_key=realkey123; Path=/; Max-Age=31536000; HttpOnly; SameSite=Lax"]
     finally:
         httpd.shutdown()
+
+
+def raw(port, request: bytes) -> bytes:
+    import socket
+    with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+        sock.sendall(request)
+        out = b""
+        while chunk := sock.recv(65536):
+            out += chunk
+    return out
+
+
+def test_bad_requests_get_an_answer(server):
+    port, work, _ = server
+    vid = work.name
+    for body in ([1, 2], "text", 3, None):
+        status, reply, _ = call(port, "POST", "/api/jobs", json.dumps(body).encode(),
+                                headers={"Content-Type": "application/json"})
+        assert status == 400 and "error" in reply, body
+    assert call(port, "POST", f"/api/videos/{vid}/captions/1", b"[]",
+                headers={"Content-Type": "application/json"})[0] in (400, 404)
+    for length in (b"abc", b"-5"):
+        reply = raw(port, b"POST /api/jobs HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Type: application/json\r\n"
+                          b"Content-Length: %s\r\n\r\n{}" % (port, length))
+        assert reply.startswith(b"HTTP/1.0 400") or reply.startswith(b"HTTP/1.1 400"), reply[:80]
+    reply = raw(port, b"PUT /api/upload HTTP/1.1\r\nHost: 127.0.0.1:%d\r\nContent-Length: x\r\n\r\n" % port)
+    assert b" 400 " in reply.split(b"\r\n")[0]
+    for t in ("abc", "inf", "nan", "-inf"):
+        assert call(port, "GET", f"/api/videos/{vid}/frame?t={t}")[0] == 400, t
+
+
+def test_cancelling_a_queued_job_is_immediate():
+    from clipper.ui.server import Job, JobManager
+    jobs = JobManager()
+    release, ran = threading.Event(), []
+    first = jobs.submit(Job("process", "first", lambda job: release.wait(10)))
+    second = jobs.submit(Job("process", "second", lambda job: ran.append(job)))
+    for _ in range(100):
+        if first.state == "running":
+            break
+        time.sleep(0.02)
+    jobs.cancel(second)
+    assert second.state == "cancelled" and second.finished
+    release.set()
+    for _ in range(100):
+        if first.state == "done":
+            break
+        time.sleep(0.02)
+    time.sleep(0.1)
+    assert first.state == "done" and second.state == "cancelled" and not ran

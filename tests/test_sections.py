@@ -163,3 +163,59 @@ def test_a_moved_video_is_found_at_its_new_place(tmp_path):
     assert work2 == work and meta2["source"] == str(moved.resolve())
     assert section_inputs(meta2) == [(str(moved.resolve()), {})]
     assert json.loads((work / "meta.json").read_text())["source"] == str(moved.resolve())
+
+
+def _main_freq(samples, rate=16000):
+    spectrum = np.abs(np.fft.rfft(samples[: rate * 2]))
+    return np.argmax(spectrum) * rate / (2 * rate)
+
+
+def test_audio_comes_from_the_first_track(tmp_path):
+    src = tmp_path / "two_tracks.mkv"
+    # the first track is mono 300 Hz; the second is stereo 1000 Hz, which ffmpeg would pick by itself
+    # (neither is marked as the default)
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=3",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=3", "-f", "lavfi", "-i", "sine=f=1000:duration=3",
+                    "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "pcm_s16le", "-ac:a:1", "2", "-disposition:a:0", "0", "-disposition:a:1", "0",
+                    str(src)], check=True)
+    extract_audio(src, tmp_path / "audio.wav")
+    assert abs(_main_freq(ingest._decode_audio(tmp_path / "audio.wav")) - 300) < 10
+    assert abs(_main_freq(ingest._decode_audio(src)) - 300) < 10
+
+
+def test_decoding_a_broken_file_fails_loudly(tmp_path):
+    bad = tmp_path / "bad.mp4"
+    bad.write_bytes(b"not a video")
+    with pytest.raises(ingest.ClipperError):
+        ingest._decode_audio(bad)
+
+
+def test_forced_download_fetches_again(tmp_path, monkeypatch):
+    downloads = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def extract_info(self, url, download):
+            out = tmp_path / "source.mp4"
+            if not out.exists():  # like yt-dlp: a file that's already there isn't downloaded again
+                downloads.append(url)
+                out.write_bytes(b"new")
+            return {"ext": "mp4"}
+
+        def prepare_filename(self, info):
+            return str(tmp_path / "source.mp4")
+
+    monkeypatch.setattr(ingest, "_yt_dlp", lambda: type("M", (), {"YoutubeDL": FakeYDL}))
+    (tmp_path / "source.mp4").write_bytes(b"old")
+    assert ingest.download("https://example.com/v", tmp_path).read_bytes() == b"old" and not downloads
+    assert ingest.download("https://example.com/v", tmp_path, force=True).read_bytes() == b"new"
+    assert downloads == ["https://example.com/v"]

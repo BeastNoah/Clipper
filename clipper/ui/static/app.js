@@ -92,9 +92,12 @@ function saveOption(key, value) {
 // ---------------------------------------------------------------------------------------------
 // Jobs polling
 
-let pollTimer = null;
+let pollTimer = null, polling = false, pollAgain = false;
 async function pollJobs() {
   clearTimeout(pollTimer);
+  // One poll at a time: two at once would both see a job finish and report it twice.
+  if (polling) { pollAgain = true; return; }
+  polling = true;
   try {
     const before = new Map(S.jobs.map(j => [j.id, j.state]));
     S.jobs = await api.get("/api/jobs");
@@ -121,6 +124,8 @@ async function pollJobs() {
       }
     }
   } catch (e) { /* server restarting: try again */ }
+  polling = false;
+  if (pollAgain) { pollAgain = false; return pollJobs(); }
   const busy = S.jobs.some(j => j.state === "running" || j.state === "queued");
   pollTimer = setTimeout(pollJobs, busy ? 1000 : 4000);
 }
@@ -367,9 +372,14 @@ function span(it) {
   return { start: s[it.si].start, end: s[it.ei].end };
 }
 
+let videoRequest = 0;
 async function loadVideo(id, tab) {
+  const request = ++videoRequest;
+  // An answer that arrives after the user went elsewhere (or asked again) is dropped.
+  const stale = () => request !== videoRequest || S.route?.name !== "video" || S.route.id !== id;
   try {
     const v = await api.get(`/api/videos/${id}`);
+    if (stale()) return;
     S.video = v;
     S.video.version = Date.now();
     S.review = v.sentences.length ? initReview(v) : null;
@@ -378,6 +388,7 @@ async function loadVideo(id, tab) {
     else if (!S.tab) S.tab = v.rendered?.some(c => c.file) ? "clips" : "review";
     renderVideo();
   } catch (e) {
+    if (stale()) return;
     $("#app").replaceChildren(h("div", { class: "panel empty" }, `Couldn't open this video: ${e.message}`));
   }
 }

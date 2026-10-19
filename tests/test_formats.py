@@ -1,4 +1,5 @@
 import json
+import re
 
 import numpy as np
 import pytest
@@ -126,3 +127,21 @@ def test_focus_and_time_range_reach_claude(tmp_path, fake_claude):
     first_line = prompt.split("<transcript>\n")[1].split("\n")[0]
     assert float(first_line.split("-")[0]) >= 119.5
     assert all(119.5 <= c["start"] and c["end"] <= 330 for c in clips)
+
+
+def test_translation_into_a_script_without_spaces():
+    from clipper.captions import build_ass, srt_lines
+
+    words = spread(0.0, 6.0, "我们今天去公园散步，然后吃了一顿非常好吃的晚饭。")
+    assert len(words) > 4 and all(len(w["w"]) <= 5 for w in words)  # not one huge "word" running off screen
+    assert "".join(w["w"] for w in words) == "我们今天去公园散步，然后吃了一顿非常好吃的晚饭。"
+    assert [w["w"] for w in spread(0, 3, "今日はiPhone15で撮影しました")][:2] == ["今日は", "iPhone15"]
+    ass = build_ass(words, 7.0)
+    shown = [re.sub(r"\{[^}]*\}", "", l.split(",,0,0,0,,")[1]) for l in ass.splitlines() if l.startswith("Dialogue: 0")]
+    assert "我们今天去公园散" in shown and not any(" " in t for t in shown)  # joined without spaces on screen
+    assert all(len(text) <= 12 for _, _, text in srt_lines(words, 20))
+
+
+def test_no_words_no_translation(tmp_path, fake_claude):
+    assert translate_clip(tmp_path, [], "Titel", "English", lambda: Claude("test")) == ([], "Titel")
+    assert not fake_claude.exists()

@@ -12,7 +12,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import subprocess
 import threading
 import time
 import urllib.request
@@ -111,8 +110,13 @@ def _finished_downloads(dest_dir: Path, stem: str = "source") -> list[Path]:
     )
 
 
-def download(url: str, dest_dir: Path, fmt: str = VIDEO_FORMAT, stem: str = "source") -> Path:
+def download(url: str, dest_dir: Path, fmt: str = VIDEO_FORMAT, stem: str = "source",
+             force: bool = False) -> Path:
     existing = _finished_downloads(dest_dir, stem)
+    if force:  # yt-dlp would skip a file that's already there, so it has to go first
+        for p in existing:
+            p.unlink()
+        existing = []
     if existing:
         log(f"ingest: reusing download {existing[0].name}")
         return existing[0]
@@ -164,7 +168,9 @@ def normalize(src: Path, dest: Path, rate: Fraction) -> None:
 
 def extract_audio(video: Path, dest: Path) -> None:
     tmp = dest.with_name("audio.tmp.wav")
-    run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-vn", "-ac", "1", "-ar", "16000",
+    # The first audio track, like the clips' sound (normalize, fetch_section): left to itself ffmpeg
+    # takes the one with the most channels, and the transcript could then be of another track.
+    run(["ffmpeg", "-y", "-v", "error", "-i", str(video), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
          "-c:a", "pcm_s16le", str(tmp)])
     os.replace(tmp, dest)
 
@@ -189,10 +195,11 @@ def _thumbnail(info: dict, dest: Path) -> None:
         pass
 
 
-def _ingest_audio_only(url: str, info: dict, work: Path, video_id: str, title: str) -> dict:
+def _ingest_audio_only(url: str, info: dict, work: Path, video_id: str, title: str, force: bool = False) -> dict:
     choice = _stream_choice(info)
     # the clips' own sound later comes from the best track (choice["audio_format"]), not this one
-    src = download(url, work, fmt=f"{SPEECH_AUDIO}/{choice['audio_format']}", stem="audio_source")
+    src = download(url, work, fmt=f"{SPEECH_AUDIO}/{choice['audio_format']}", stem="audio_source",
+                   force=force)
     extract_audio(src, work / "audio.wav")
     _thumbnail(info, work / "thumb.jpg")
     rate = pick_frame_rate({"avg_frame_rate": str(Fraction(choice["fps"]).limit_denominator(1001))
@@ -278,7 +285,7 @@ def ingest(source: str, work_root: Path, force: bool = False, download_mode: str
 
     if download_mode == "sections":
         if info is not None:
-            meta = _ingest_audio_only(source, info, work, video_id, title)
+            meta = _ingest_audio_only(source, info, work, video_id, title, force)
             log(f"ingest: audio only for now ({meta['duration']:.0f}s); video is fetched just for the clips")
         else:
             meta = _ingest_local_audio(Path(source), work, video_id, title)
@@ -287,7 +294,7 @@ def ingest(source: str, work_root: Path, force: bool = False, download_mode: str
         write_json(meta_path, meta)
         return work, meta
 
-    src = download(source, work) if is_url(source) else Path(source)
+    src = download(source, work, force=force) if is_url(source) else Path(source)
     vs = _check_streams(ffprobe(src), src)
 
     rate = pick_frame_rate(vs)
@@ -391,8 +398,8 @@ def fetch_section(inputs: list[tuple[str, dict]], start: float, end: float, rate
 
 
 def _decode_audio(path: Path) -> np.ndarray:
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
-                          "-f", "s16le", "-"], capture_output=True).stdout
+    raw = run(["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+               "-f", "s16le", "-"]).stdout
     return np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
 
 

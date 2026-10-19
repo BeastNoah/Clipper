@@ -11,11 +11,12 @@ import os
 import re
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Callable, TypeVar
 
-from .util import ClipperError, log, run_proc
+from .util import Cancelled, ClipperError, check_cancel, log, run_proc
 
 T = TypeVar("T")
 
@@ -38,7 +39,13 @@ def extract_json(text: str) -> object:
         raise InvalidReply(f"The reply is not valid JSON: {e}") from e
 
 
+class ClaudeFailed(ClipperError):
+    """The claude command itself failed (timed out, crashed, or reported an error); worth another try."""
+
+
 class Claude:
+    retry_delays = (5, 20)  # seconds to wait before the 2nd and 3rd try after a failed call
+
     def __init__(self, model: str = "opus", cwd: Path | None = None, max_attempts: int = 3,
                  timeout: int = 900, binary: str | None = None):
         self.model = model
@@ -60,21 +67,41 @@ class Claude:
             code, stdout, stderr = run_proc(cmd, input=message.encode(), cwd=self.cwd, env=env,
                                             timeout=self.timeout)
         except subprocess.TimeoutExpired as e:
-            raise ClipperError(f"claude did not answer within {self.timeout}s") from e
+            raise ClaudeFailed(f"claude did not answer within {self.timeout}s") from e
         out = stdout.decode(errors="replace")
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
             err = (stderr.decode(errors="replace") or out).strip()[-1500:]
-            raise ClipperError(f"claude failed (exit {code}): {err}")
-        if data.get("is_error") or code != 0:
-            raise ClipperError(f"claude returned an error: {str(data.get('result') or data)[:1500]}")
+            raise ClaudeFailed(f"claude failed (exit {code}): {err}")
+        if not isinstance(data, dict) or data.get("is_error") or code != 0:
+            detail = data.get("result") or data if isinstance(data, dict) else data
+            raise ClaudeFailed(f"claude returned an error: {str(detail)[:1500]}")
         return str(data.get("result", "")), data.get("session_id")
+
+    def _call_retrying(self, system: str, message: str, session_id: str, resume: bool,
+                       what: str) -> tuple[str, str | None]:
+        for attempt, delay in enumerate((*self.retry_delays, None), 1):
+            try:
+                return self._call(system, message, session_id, resume)
+            except Cancelled:
+                raise
+            except ClaudeFailed as e:
+                if delay is None:
+                    raise
+                log(f"select: {what}: {str(e)[:300]}; trying again in {delay}s")
+                end = time.monotonic() + delay
+                while time.monotonic() < end:
+                    check_cancel()
+                    time.sleep(min(0.25, max(0.0, end - time.monotonic())))
+                if not resume:  # the failed call may have started a conversation with this id
+                    session_id = str(uuid.uuid4())
+        raise AssertionError("unreachable")
 
     def ask(self, system: str, prompt: str, parse: Callable[[str], T], what: str = "request") -> T:
         session_id, message = str(uuid.uuid4()), prompt
         for attempt in range(1, self.max_attempts + 1):
-            reply, returned_id = self._call(system, message, session_id, resume=attempt > 1)
+            reply, returned_id = self._call_retrying(system, message, session_id, attempt > 1, what)
             session_id = returned_id or session_id
             try:
                 return parse(reply)

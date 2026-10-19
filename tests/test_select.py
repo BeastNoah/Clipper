@@ -306,3 +306,50 @@ def test_video_ids_are_ascii_and_bad_options_fail_early(tmp_path):
         Options(highlight_color="red").validate()
     with pytest.raises(ClipperError, match="layout"):
         Options(layout="sideways").validate()
+
+
+def test_ids_stay_unique_after_starting_over(tmp_path, fake_claude):
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(120)])
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    kw = dict(min_len=20, max_len=40, model="test", claude_factory=lambda: Claude("test"))
+    made = select_clips(tmp_path, meta, {"words": words}, num_clips=2, **kw)
+    first_ids = {c["id"] for c in saved_candidates(tmp_path)}
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "clips.json").write_text(json.dumps(made))  # these were rendered
+    select_clips(tmp_path, meta, {"words": words}, num_clips=2, force=True, **kw)
+    new_ids = [c["id"] for c in saved_candidates(tmp_path)]
+    assert len(new_ids) == len(set(new_ids))
+    assert not set(new_ids) & first_ids  # an old clip must not take a new suggestion's title or post
+
+
+def test_failed_claude_calls_are_tried_again(tmp_path, fake_claude, monkeypatch):
+    fails = tmp_path / "fails"
+    fails.write_text("2")
+    monkeypatch.setenv("FAKE_CLAUDE_FAILS", str(fails))
+    monkeypatch.setattr(Claude, "retry_delays", (0, 0))
+    assert Claude("test").ask("system", "prompt", json.loads) == {"error": "unrecognised prompt"}
+    calls = _calls(fake_claude)
+    assert len(calls) == 3 and fails.read_text() == "0"
+    sessions = [c["argv"][c["argv"].index("--session-id") + 1] for c in calls]
+    assert len(set(sessions)) == 3  # a failed call may have opened its conversation, so each try has its own
+
+    fails.write_text("3")  # failing every try gives up
+    with pytest.raises(ClipperError, match="exit 1"):
+        Claude("test").ask("system", "prompt", json.loads)
+
+
+def test_answers_for_other_parts_are_kept_when_one_part_fails(tmp_path, fake_claude, monkeypatch):
+    monkeypatch.setattr(Claude, "retry_delays", (0, 0))
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(700)])  # 3 chunks
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    kw = dict(min_len=20, max_len=45, model="test", claude_factory=lambda: Claude("test"))
+    monkeypatch.setenv("FAKE_CLAUDE_FAIL_FROM", "1")  # the first part works, the later ones fail
+    with pytest.raises(ClipperError, match="overloaded"):
+        select_clips(tmp_path, meta, {"words": words}, num_clips=4, **kw)
+    state = json.loads((tmp_path / "select.json").read_text())
+    assert state["done"] == ["initial:0"] and state["candidates"]
+    monkeypatch.delenv("FAKE_CLAUDE_FAIL_FROM")
+    n = len(_calls(fake_claude))
+    select_clips(tmp_path, meta, {"words": words}, num_clips=4, **kw)
+    asked = [c for c in _calls(fake_claude)[n:] if "<transcript>" in c["prompt"] and "already taken" not in c["prompt"]]
+    assert len(asked) == 2  # only the parts that failed are asked about again

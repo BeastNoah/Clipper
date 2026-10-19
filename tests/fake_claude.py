@@ -7,6 +7,9 @@ FAKE_CLAUDE_MAX: propose at most this many clips per request.
 FAKE_CLAUDE_LONG=1: propose clips that run past the maximum length (so clipper asks for a trim).
 FAKE_CLAUDE_DUP=1: when re-scoring, mark the second clip as a duplicate of the first.
 FAKE_CLAUDE_SLEEP: seconds to think before answering a request for clips.
+FAKE_CLAUDE_FAILS: a file holding a number; while it's above 0, fail (and count down) like a crashed CLI.
+FAKE_CLAUDE_FAIL_FROM: fail every request for clips in a part of the transcript starting at or after
+    this many seconds.
 """
 import fcntl
 import json
@@ -31,6 +34,21 @@ def reply(obj, session=SESSION):
     print(json.dumps({"type": "result", "is_error": False, "result": text, "session_id": session}))
     sys.exit(0)
 
+
+if os.environ.get("FAKE_CLAUDE_FAILS"):
+    with open(os.environ["FAKE_CLAUDE_FAILS"], "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        left = int(f.read() or 0)
+        if left > 0:
+            f.seek(0), f.truncate(), f.write(str(left - 1))
+            print("Error: overloaded", file=sys.stderr)
+            sys.exit(1)
+
+if os.environ.get("FAKE_CLAUDE_FAIL_FROM") and "<transcript>" in prompt:
+    first = re.search(r"<transcript>\s*([\d.]+)-", prompt)
+    if first and float(first[1]) >= float(os.environ["FAKE_CLAUDE_FAIL_FROM"]):
+        print(json.dumps({"type": "result", "is_error": True, "result": "API Error: 529 overloaded"}))
+        sys.exit(1)
 
 if os.environ.get("FAKE_CLAUDE_BAD_FIRST") and not resume:
     reply("Sure! Here are some great clips: (no JSON, oops)")

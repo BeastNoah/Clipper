@@ -11,6 +11,7 @@ import argparse
 import hmac
 import ipaddress
 import json
+import math
 import mimetypes
 import queue
 import os
@@ -53,10 +54,15 @@ scan the QR code shown in the terminal (or under <b>Phone</b> in clipper there),
 printed next to it.</p></body>"""
 VIDEO_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 MAX_LOG = 400
+MAX_BODY = 10 << 20  # JSON requests; uploads go through PUT
 
 
 # ---------------------------------------------------------------------------------------------
 # Jobs
+
+class BadRequest(Exception):
+    pass
+
 
 @dataclass
 class Job:
@@ -114,13 +120,21 @@ class JobManager:
                 job.video = payload
         return sink
 
+    def cancel(self, job: Job) -> None:
+        with self.lock:
+            job.cancel.set()
+            if job.state == "queued":  # never started: done with it now, not when the worker gets to it
+                job.state, job.finished = "cancelled", time.time()
+
     def _worker(self) -> None:
         while True:
             job = self.queue.get()
-            if job.cancel.is_set():
-                job.state, job.finished = "cancelled", time.time()
-                continue
-            job.state = "running"
+            with self.lock:
+                if job.cancel.is_set():
+                    if job.state == "queued":
+                        job.state, job.finished = "cancelled", time.time()
+                    continue
+                job.state = "running"
             set_reporter(self._sink(job), job.cancel)
             try:
                 job.run(job)
@@ -230,12 +244,26 @@ class Handler(BaseHTTPRequestHandler):
     def _error(self, status: int, message: str) -> None:
         self._json({"error": message}, status)
 
-    def _body(self) -> dict:
-        length = int(self.headers.get("Content-Length") or 0)
+    def _length(self) -> int:
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            raise BadRequest("bad Content-Length") from None
+        if length < 0:
+            raise BadRequest("bad Content-Length")
+        return length
+
+    def _body(self) -> dict:
+        length = self._length()
+        if length > MAX_BODY:
+            raise BadRequest("request too large")
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:  # also bytes that aren't UTF-8
             return {}
+        if not isinstance(body, dict):
+            raise BadRequest("send a JSON object")
+        return body
 
     def _work(self, vid: str) -> Path | None:
         if not VIDEO_ID.match(vid):
@@ -392,7 +420,12 @@ class Handler(BaseHTTPRequestHandler):
                                    "lines": caption_lines(work, clip),
                                    "edited": edited_words(work, clip) is not None})
             if route[2:] == ["frame"]:
-                t = float((qs.get("t") or ["0"])[0])
+                try:
+                    t = float((qs.get("t") or ["0"])[0])
+                except ValueError:
+                    t = math.nan
+                if not math.isfinite(t):
+                    return self._error(400, "t must be a time in seconds")
                 return self._file(frame_jpeg(work, max(0.0, t)), cache=True)
         if route == ["jobs"]:
             return self._json(self.app.jobs.list())
@@ -402,6 +435,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._error(404, "not found")
 
     def do_POST(self):
+        try:
+            self._post()
+        except BadRequest as e:
+            self.close_connection = True  # the body may not have been read
+            self._error(400, str(e))
+
+    def _post(self):
         parts = [p for p in urlparse(self.path).path.strip("/").split("/") if p]
         if not (self.headers.get("Content-Type") or "").startswith("application/json"):
             return self._error(415, "send JSON")  # also keeps other web pages from posting forms here
@@ -430,7 +470,7 @@ class Handler(BaseHTTPRequestHandler):
             job = self.app.jobs.jobs.get(parts[2])
             if not job:
                 return self._error(404, "no such job")
-            job.cancel.set()
+            self.app.jobs.cancel(job)
             return self._json(job.public())
         return self._error(404, "not found")
 
@@ -440,7 +480,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(404, "not found")
         name = (parse_qs(url.query).get("name") or ["upload.mp4"])[0]
         name = re.sub(r"[^\w.-]+", "_", Path(name).name).strip("._") or "upload.mp4"
-        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            length = self._length()
+        except BadRequest as e:
+            self.close_connection = True
+            return self._error(400, str(e))
         if length <= 0:
             return self._error(400, "empty upload")
         # Every upload gets its own folder: a later file with the same name must never replace one that

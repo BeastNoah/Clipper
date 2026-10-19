@@ -136,3 +136,29 @@ def test_two_people_close_together_are_framed_together():
 def test_no_cut_in_the_last_few_frames():
     changes = [0.0] + [1.0] * 58 + [60.0, 1.0, 1.0]  # a cut 2 frames before the end would be a flash
     assert detect_cuts(changes, 30) == []
+
+
+def test_split_screen_keeps_its_shape_on_a_square_source():
+    n, W, H = 20, 1080, 1080
+    big = [[(250.0, 540.0, 300.0, 300.0, 1.0), (830.0, 540.0, 300.0, 300.0, 1.0)] for _ in range(n)]
+    mode, vals, _ = plan_shot(big, [k * 6 for k in range(n)], 0, 120, W, H, crop_width(W, H), 30, "split",
+                              [True] * n)
+    assert mode == "split"
+    xl, yl, xr, yr, hc = vals[0]
+    wc = round(hc * 1080 / 960 / 2) * 2  # the crop width split_frame takes for this height
+    assert wc <= W and abs(wc / hc - 1080 / 960) < 0.01
+    assert 0 <= yl <= H - hc and 0 <= yr <= H - hc and 0 <= xl <= W - wc and 0 <= xr <= W - wc
+
+
+def test_reframe_result_from_the_fallback_detector_isnt_reused_with_yunet(tmp_path, monkeypatch):
+    import clipper.reframe as rf
+    from clipper.ingest import ClipVideo
+
+    runs = []
+    monkeypatch.setattr(rf, "analyze", lambda *a, **k: runs.append(1) or {"x": []})
+    src = ClipVideo(tmp_path / "section.mp4", 0.0, 1920, 1080, "30")
+    clip = {"start": 1.0, "end": 9.0, "rank": 1}
+    for kind in ("haar", "haar", "yunet"):
+        monkeypatch.setattr(rf.FaceDetector, "kind_available", classmethod(lambda cls, k=kind: k))
+        rf.reframe(tmp_path, {}, clip, tmp_path, src=src)
+    assert len(runs) == 2

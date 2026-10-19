@@ -3,12 +3,13 @@ spread over the translated words, so the word-by-word highlight still roughly fo
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable
 
 from pydantic import BaseModel, ValidationError
 
-from .captions import _phrases
+from .captions import _WIDE, _phrases, text_width
 from .llm import Claude, InvalidReply, extract_json
 from .util import fingerprint, log, read_json, write_json
 
@@ -51,12 +52,30 @@ JSON object in exactly this format, with {len(lines)} lines:
 {{"title": "...", "lines": ["...", "..."]}}"""
 
 
+CHUNK_WIDTH = 8  # a caption "word" in Chinese or Japanese: about four characters
+
+
+def _chunks(token: str) -> list[str]:
+    """Short pieces of a run of text without spaces (Chinese, Japanese); other tokens stay whole.
+    Latin words and numbers inside stay whole, and punctuation stays with the text before it."""
+    if not _WIDE.search(token) or text_width(token) <= CHUNK_WIDTH:
+        return [token]
+    out: list[str] = []
+    for atom in re.findall(rf"(?:(?!{_WIDE.pattern})[^\W_])+|.", token, re.S):
+        if out and (not re.match(r"\w", atom) or text_width(out[-1]) + text_width(atom) <= CHUNK_WIDTH
+                    and not re.search(r"\W$", out[-1])):
+            out[-1] += atom
+        else:
+            out.append(atom)
+    return out
+
+
 def spread(start: float, end: float, text: str) -> list[dict]:
     """Words of `text` with times spread over [start, end] in proportion to their length."""
-    tokens = text.split()
+    tokens = [c for tok in text.split() for c in _chunks(tok)]
     if not tokens:
         return []
-    weights = [len(t) + 1 for t in tokens]
+    weights = [text_width(t) + 1 for t in tokens]
     total, t, out = sum(weights), start, []
     for tok, w in zip(tokens, weights):
         d = (end - start) * w / total
@@ -69,6 +88,8 @@ def translate_clip(cdir: Path, words: list[dict], title: str, language: str,
                    claude_factory: Callable[[], Claude]) -> tuple[list[dict], str]:
     """(translated words with times in the finished clip, translated title)."""
     phrases = _phrases(words)
+    if not phrases:  # nothing is said in the clip: no captions to translate
+        return [], title
     texts = [" ".join(w["w"] for w in p) for p in phrases]
     key = fingerprint([language, title, texts])
     path = cdir / f"translation-{fingerprint(language)[:6]}.json"

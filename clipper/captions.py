@@ -103,6 +103,25 @@ def map_words(words: list[dict], start: float, edit: EditMap) -> list[dict]:
     return out
 
 
+# Scripts written without spaces between words (Chinese, Japanese). Their characters are about twice
+# as wide as Latin ones, and caption "words" in them are joined without a space.
+_WIDE = re.compile(r"[\u2e80-\u303f\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uff00-\uff60]")
+
+
+def text_width(text: str) -> int:
+    """Width of text in Latin characters."""
+    return len(text) + len(_WIDE.findall(text))
+
+
+def join_words(texts: list[str]) -> str:
+    out = ""
+    for t in texts:
+        if out and t and not (_WIDE.match(out[-1]) and _WIDE.match(t[0])):
+            out += " "
+        out += t
+    return out
+
+
 def _phrases(words: list[dict]) -> list[list[dict]]:
     """Split at sentence ends and pauses; a line never crosses either."""
     phrases, cur = [], []
@@ -129,7 +148,7 @@ def _partition(phrase: list[dict], max_chars: int) -> list[list[dict]]:
         for size in range(1, min(MAX_WORDS, j) + 1):
             i = j - size
             line = phrase[i:j]
-            chars = sum(len(w["w"]) for w in line) + size - 1
+            chars = text_width(join_words([w["w"] for w in line]))
             cost = 1.0 + 0.1 * abs(size - 3)
             if size == 1 and n > 1:
                 cost += 1.5
@@ -249,7 +268,9 @@ def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS[
             if round(end * 100) <= round(start * 100):
                 continue
             parts = []
-            for x in line:
+            for k, x in enumerate(line):
+                if k and join_words([line[k - 1]["w"], x["w"]]) != line[k - 1]["w"] + x["w"]:
+                    parts.append(" ")
                 text = _display(x["w"], style)
                 is_key = index[id(x)] in emphasized
                 if x is w:
@@ -262,7 +283,7 @@ def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS[
                     parts.append(f"{{{em}}}{text}{{{base}}}")
                 else:
                     parts.append(text)
-            events.append(f"Dialogue: 0,{_ts(start)},{_ts(end)},Default,,0,0,0,,{' '.join(parts)}")
+            events.append(f"Dialogue: 0,{_ts(start)},{_ts(end)},Default,,0,0,0,,{''.join(parts)}")
     styles = [_caption_style_line(style, fmt), _title_style_line(style, "Title", 62, 8, fmt.v(250))]
     return _header(styles, fmt) + "\n".join(events) + "\n"
 
@@ -294,12 +315,12 @@ def srt_lines(words: list[dict], max_chars: int = 42) -> list[tuple[float, float
     for phrase in _phrases(words):
         line: list[dict] = []
         for w in phrase:
-            if line and len(" ".join(x["w"] for x in line + [w])) > max_chars:
-                out.append((line[0]["s"], line[-1]["e"], " ".join(x["w"] for x in line)))
+            if line and text_width(join_words([x["w"] for x in line + [w]])) > max_chars:
+                out.append((line[0]["s"], line[-1]["e"], join_words([x["w"] for x in line])))
                 line = []
             line.append(w)
         if line:
-            out.append((line[0]["s"], line[-1]["e"], " ".join(x["w"] for x in line)))
+            out.append((line[0]["s"], line[-1]["e"], join_words([x["w"] for x in line])))
     return out
 
 
