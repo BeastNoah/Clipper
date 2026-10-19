@@ -461,8 +461,8 @@ function initReview(v) {
   const current = new Set(sig.split(",").filter(Boolean));
   const covers = old => old != null && old.split(",").filter(Boolean).every(x => current.has(x));
   const latest = Math.max(1, ...v.candidates.map(c => c.search || 1));
-  const order = c => c.order ?? Infinity;  // Claude's ranking of all candidates, where there is one
-  const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || order(a) - order(b) || (b.score ?? 0) - (a.score ?? 0));
+  const rankOf = c => c.order ?? Infinity;  // Claude's ranking of all candidates, where there is one
+  const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || rankOf(a) - rankOf(b) || (b.score ?? 0) - (a.score ?? 0));
   const picked = new Set((v.clips || []).map(c => c.id));
   const items = {};
   for (const c of cands) items[c.id] = { key: c.id, id: c.id, si: c.si, ei: c.ei, title: c.title, selected: picked.has(c.id), cand: c };
