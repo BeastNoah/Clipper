@@ -461,7 +461,8 @@ function initReview(v) {
   const current = new Set(sig.split(",").filter(Boolean));
   const covers = old => old != null && old.split(",").filter(Boolean).every(x => current.has(x));
   const latest = Math.max(1, ...v.candidates.map(c => c.search || 1));
-  const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || (b.score ?? 0) - (a.score ?? 0));
+  const order = c => c.order ?? Infinity;  // Claude's ranking of all candidates, where there is one
+  const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || order(a) - order(b) || (b.score ?? 0) - (a.score ?? 0));
   const picked = new Set((v.clips || []).map(c => c.id));
   const items = {};
   for (const c of cands) items[c.id] = { key: c.id, id: c.id, si: c.si, ei: c.ei, title: c.title, selected: picked.has(c.id), cand: c };
@@ -656,8 +657,8 @@ function candView(it, n) {
   const { start, end } = span(it);
   const nS = S.video.sentences.length;
   const change = (fn) => () => { fn(); persistReview(); renderCands(); renderRenderBar(); if (S.review.focus === it.key) renderTranscript(); };
-  const subs = c?.scores ? h("div", { class: "subs" }, [["hook", "Hook"], ["standalone", "Standalone"], ["emotion", "Emotion"], ["clarity", "Clarity"]].map(([k, label]) =>
-    h("div", { class: "sub" }, `${label} ${c.scores[k] ?? "–"}`, h("div", { class: "bar" }, h("i", { style: `width:${((c.scores[k] ?? 0) / 25) * 100}%` }))))) : null;
+  const subs = c?.scores ? h("div", { class: "subs" }, [["hook", "Hook"], ["payoff", "Payoff"], ["reaction", "Reaction"], ["pace", "Pace"]].map(([k, label]) =>
+    h("div", { class: "sub" }, `${label} ${c.scores[k] ?? "–"}`, h("div", { class: "bar" }, h("i", { style: `width:${((c.scores[k] ?? 0) / 10) * 100}%` }))))) : null;
   const moved = c && (it.si !== c.si || it.ei !== c.ei);
   return h("div", { class: "cand" + (it.selected ? " selected" : "") + (c?.duplicate_of ? " dimmed" : "") },
     h("input", { type: "checkbox", "aria-label": "Use this clip", checked: it.selected, onchange: e => { it.selected = e.target.checked; persistReview(); renderCands(); renderRenderBar(); } }),
@@ -665,7 +666,8 @@ function candView(it, n) {
     h("div", {},
       h("input", { class: "cand-title", value: it.title, "aria-label": "Clip title", onchange: e => { it.title = e.target.value; persistReview(); } }),
       h("div", { class: "meta" },
-        c?.score != null ? h("span", { class: "score", title: "Claude's score out of 100" }, c.score) : h("span", { class: "badge" }, "your clip"),
+        c?.score != null ? h("span", { class: "score", title: "Claude's score out of 100: hook × payoff × (reaction and pace)" }, c.score) : h("span", { class: "badge" }, "your clip"),
+        c?.type && c.type !== "other" ? h("span", { class: "chip", title: "The kind of moment" }, c.type) : null,
         h("span", {}, `${fmt(start)}–${fmt(end)}`), h("span", {}, `${Math.round(end - start)}s`),
         moved ? h("span", { class: "chip" }, "adjusted") : null),
       subs,

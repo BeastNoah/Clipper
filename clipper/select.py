@@ -13,13 +13,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from .audio import Loudness, sentence_cues
 from .llm import Claude, InvalidReply, extract_json
 from .util import Cancelled, ClipperError, fingerprint, fmt_time, log, read_json, thread_pool, write_json
 
-SELECT_VERSION = 2
+SELECT_VERSION = 3
 CHUNK_SECONDS = 15 * 60
 MAX_SENTENCE_SECONDS = 15.0  # longer "sentences" (run-ons, missing punctuation) get split
 SENTENCE_GAP = 2.0           # a pause this long ends a sentence even without punctuation
@@ -34,18 +34,34 @@ _ABBREVIATIONS = {"mr.", "mrs.", "ms.", "dr.", "prof.", "st.", "vs.", "e.g.", "i
 SYSTEM_PROMPT = """\
 You are a senior short-form video editor. You cut long videos (podcasts, interviews, talks, \
 streams) into vertical clips for TikTok, Instagram Reels and YouTube Shorts. You know what makes \
-people stop scrolling and watch to the end: a strong first line, one complete idea or story with a \
-payoff, and no need for outside context. You judge strictly. You answer with JSON only."""
+people stop scrolling, watch to the end and share: a first line that demands attention, one complete \
+moment that pays off on its last line, and no need for outside context. You judge strictly. You \
+answer with JSON only."""
+
+MOMENT_TYPES = ("joke", "story", "hot take", "insight", "confession", "roast", "relatable", "other")
 
 RUBRIC = """\
-Score each clip with four sub-scores, each from 0 to 25:
-- hook: how strongly the first line or two make a viewer stop scrolling
-- standalone: how well it makes sense to someone who has not seen the rest of the video
-- emotion: how much emotion, surprise or humour it carries
-- clarity: how clear and easy to follow it is (no rambling, false starts, or references to \
-things only visible on screen)
-A clip's score is the sum of its sub-scores (0-100). Be critical: a total above 80 is only for \
-clips that would do really well on their own."""
+A clip must pass all three checks; one that fails any of them is not a clip, whatever else it has \
+going for it:
+- It makes sense to someone who has not seen the rest of the video.
+- It does not depend on anything only visible on screen.
+- It has a real ending: it stops on a line that lands, not where the speaker trails off.
+
+Score each clip on four counts, each from 0 to 10:
+- hook: would a stranger stop scrolling in the first 3 seconds? 9-10: an open question, a bold claim, \
+or the middle of something happening ("I got fired on my second day, and it was the best thing..."). \
+4-5: a decent line that still needs set-up to matter. 0-2: "So, um, the other thing is..."
+- payoff: does the last line land? 9-10: a punchline, a reveal, a twist, or a line people would \
+quote. 4-5: the point gets made, then it just stops. 0-2: trails off, or cuts before the point.
+- reaction: what does a viewer do right after? 9-10: laughs out loud, says "wait, what?", sends it \
+to a friend, or has to argue in the comments. 4-5: nods. 0-2: nothing.
+- pace: how dense it is. 9-10: every line earns its place. 4-5: some rambling or repetition. \
+0-2: mostly filler, false starts and "basically".
+A note like [+1.8s non-speech sound] after a line inside the clip is usually laughter or applause \
+from the people who were there: treat it as strong evidence for payoff and reaction.
+Be strict: most moments in any video are 4-6 on every count. The score multiplies hook and payoff, \
+so a clip with a weak hook or no payoff is a weak clip however good the rest.
+Also name the kind of moment: one of {types}.""".format(types=", ".join(MOMENT_TYPES))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -136,10 +152,23 @@ def make_chunks(sentences: list[Sentence], overlap: float,
 # Reply formats
 
 class SubScores(BaseModel):
-    hook: int = Field(ge=0, le=25)
-    standalone: int = Field(ge=0, le=25)
-    emotion: int = Field(ge=0, le=25)
-    clarity: int = Field(ge=0, le=25)
+    hook: int = Field(ge=0, le=10)
+    payoff: int = Field(ge=0, le=10)
+    reaction: int = Field(ge=0, le=10)
+    pace: int = Field(ge=0, le=10)
+
+
+def combine(scores: dict) -> int:
+    """One 0-100 score from the four counts. Hook and payoff multiply: nobody sees the rest of a clip
+    they scrolled past, and a clip that doesn't land isn't shared, so neither can be made up for
+    elsewhere. Reaction and pace share the last factor."""
+    rest = 0.6 * scores["reaction"] + 0.4 * scores["pace"]
+    return int(round(scores["hook"] * scores["payoff"] * rest / 10))
+
+
+def moment_type(value: str) -> str:
+    t = re.sub(r"[\s_-]+", " ", str(value).strip().lower())
+    return t if t in MOMENT_TYPES else "other"
 
 
 class ProposedClip(BaseModel):
@@ -147,8 +176,14 @@ class ProposedClip(BaseModel):
     end: float
     title: str = Field(min_length=1, max_length=120)
     hook: str = Field(min_length=1)
+    type: str = "other"
     scores: SubScores
     keywords: list[str] = Field(default_factory=list, max_length=5)
+
+    @field_validator("type")
+    @classmethod
+    def _known_type(cls, v: str) -> str:
+        return moment_type(v)
 
 
 class ProposalReply(BaseModel):
@@ -161,7 +196,7 @@ class Rescore(SubScores):
 
 
 class RescoreReply(BaseModel):
-    scores: list[Rescore]
+    ranking: list[Rescore]  # best first
 
 
 class Trim(BaseModel):
@@ -196,8 +231,9 @@ def parse_proposals(reply: str, lo: float, hi: float) -> list[dict]:
 
 
 def parse_rescores(reply: str, ids: list[str]) -> dict[str, dict]:
+    """{clip id: {sub-scores, duplicate_of, order}}; order is the clip's place in Claude's ranking, 0 first."""
     parsed = _validate(RescoreReply, reply)
-    got = [s.id for s in parsed.scores]
+    got = [s.id for s in parsed.ranking]
     problems = []
     missing = [i for i in ids if i not in got]
     if missing:
@@ -208,12 +244,12 @@ def parse_rescores(reply: str, ids: list[str]) -> dict[str, dict]:
     dupes = sorted({i for i in got if got.count(i) > 1})
     if dupes:
         problems.append("scored more than once: " + ", ".join(dupes))
-    for s in parsed.scores:
+    for s in parsed.ranking:
         if s.duplicate_of is not None and (s.duplicate_of not in ids or s.duplicate_of == s.id):
             problems.append(f"{s.id}: duplicate_of must be the id of another clip in the list, or null")
     if problems:
         raise InvalidReply("; ".join(problems) + ". Give exactly one entry per clip id.")
-    return {s.id: s.model_dump(exclude={"id"}) for s in parsed.scores}
+    return {s.id: {**s.model_dump(exclude={"id"}), "order": n} for n, s in enumerate(parsed.ranking)}
 
 
 def parse_trims(reply: str, jobs: dict[str, tuple[int, int]], tl: "Timeline", min_len: float,
@@ -321,10 +357,16 @@ def merged_length(spans: list[tuple[float, float]], lo: float, hi: float) -> flo
     return total
 
 
+def rank_key(c: dict) -> tuple:
+    """Best clip first: Claude's ranking of all candidates where there is one, else the score."""
+    order = c.get("order")
+    return (math.inf if order is None else order, -c["score"], c["start"])
+
+
 def resolve_overlaps(cands: list[dict]) -> list[dict]:
-    """Where clips overlap, or Claude marked two as telling the same story, keep the higher-scoring one."""
+    """Where clips overlap, or Claude marked two as telling the same story, keep the better-ranked one."""
     kept: list[dict] = []
-    for c in sorted(cands, key=lambda c: (-c["score"], c["start"])):
+    for c in sorted(cands, key=rank_key):
         clash = any(
             not (c["end"] <= k["start"] or c["start"] >= k["end"])
             or (c.get("duplicate_of") is not None and c.get("duplicate_of") == k.get("id"))
@@ -348,6 +390,7 @@ def make_clip(tl: Timeline, rank: int, si: int, ei: int, base: dict | None = Non
         "id": base.get("id") or f"u{si}-{ei}",
         "title": (title or base.get("title") or tl.sentences[si].text[:50]).strip(),
         "hook": base.get("hook") if same_start and base.get("hook") else tl.sentences[si].text,
+        "type": base.get("type"),
         "score": base.get("score"),
         "scores": base.get("scores"),
         "start": start, "end": end, "duration": round(end - start, 3),
@@ -409,40 +452,47 @@ Find up to {count} of the best moments in this part to cut into standalone short
 
 Reply with only a JSON object in exactly this format:
 {{"clips": [{{"start": 123.4, "end": 161.0, "title": "Short catchy title", \
-"hook": "The opening line, quoted from the transcript", \
-"scores": {{"hook": 20, "standalone": 18, "emotion": 15, "clarity": 22}}, \
+"hook": "The opening line, quoted from the transcript", "type": "joke", \
+"scores": {{"hook": 8, "payoff": 7, "reaction": 6, "pace": 8}}, \
 "keywords": ["the word that lands"]}}]}}
 - title: in the language of the video, at most 50 characters; it is shown on screen as the clip starts.
 - keywords: 1-3 words or short phrases from the clip that carry its punch; they get highlighted \
 in the captions."""
 
 
-def _rescore_prompt(title: str, cands: list[dict], focus: str | None = None) -> str:
+def _rescore_prompt(title: str, cands: list[dict], focus: str | None = None,
+                    audio: dict[str, str] | None = None) -> str:
+    """audio: per clip id, a note on what the audio shows inside the clip (laughter, applause), if anything."""
+    audio = audio or {}
     focus_txt = (f"\n\nThe person making the clips is looking for: {focus}. Clips that don't fit this "
-                 "should score low.") if focus else ""
+                 "go to the bottom.") if focus else ""
     blocks = "\n\n".join(
         f"[{c['id']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} ({c['end'] - c['start']:.0f}s) "
-        f"\"{c['title']}\"\n{c['text']}"
+        f"{c.get('type') or 'other'} \"{c['title']}\"\n{c['text']}"
+        + (f"\n({audio[c['id']]})" if audio.get(c["id"]) else "")
         for c in cands
     )
     return f"""\
 Video title: {title}
 
-These candidate clips come from different parts of the same video. They were scored separately, \
-so their scores are not comparable. Score all of them again on one common scale, comparing them \
-with each other.{focus_txt}
+These candidate clips come from different parts of the same video. They were judged separately, \
+so their scores are not comparable. Compare them with each other: put them in order, from the one \
+most likely to do well as a short clip to the least, and score each again on one common scale. \
+Between two clips of the same kind that would land the same way, the better one goes first and the \
+other goes down the list, so the top of the ranking has some variety.{focus_txt}
 
 {RUBRIC}
 
 <clips>
 {blocks}
 </clips>
-
+{"Notes in brackets under a clip say what the audio shows inside it." if audio else ""}
 If a clip makes the same point or tells the same story as a better clip in the list, set its \
 "duplicate_of" to that better clip's id; otherwise set it to null.
 
-Reply with only a JSON object with one entry for every clip id above, in exactly this format:
-{{"scores": [{{"id": "{cands[0]['id']}", "hook": 20, "standalone": 18, "emotion": 15, "clarity": 22, \
+Reply with only a JSON object listing every clip id above exactly once, best first, in exactly \
+this format:
+{{"ranking": [{{"id": "{cands[0]['id']}", "hook": 8, "payoff": 7, "reaction": 6, "pace": 8, \
 "duplicate_of": null}}]}}"""
 
 
@@ -561,8 +611,9 @@ class Selector:
             "focus": self.focus,
             "title": proposal["title"].strip().strip('"'),
             "hook": proposal["hook"].strip(),
+            "type": proposal.get("type") or "other",
             "scores": proposal["scores"],
-            "score": sum(proposal["scores"].values()),
+            "score": combine(proposal["scores"]),
             "keywords": [k.strip() for k in proposal.get("keywords", [])
                          if k.strip() and k.strip().lower() in text.lower()][:3],
             "proposed": [proposal["start"], proposal["end"]],
@@ -654,6 +705,18 @@ class Selector:
         if failed:
             raise failed
 
+    def _audio_note(self, c: dict) -> str:
+        """What the audio cues say about a candidate, for the ranking prompt (the text alone has lost them)."""
+        notes = [self.cues[i] for i in range(c["si"], c["ei"] + 1) if i in self.cues]
+        sounds = sum("non-speech sound" in n for n in notes)
+        loud = sum("[loud" in n for n in notes)
+        parts = []
+        if sounds:
+            parts.append(f"non-speech sound, probably laughter or applause, after {sounds} line(s)")
+        if loud:
+            parts.append(f"{loud} line(s) said noticeably louder than usual")
+        return "audio: " + "; ".join(parts) if parts else ""
+
     def _rescore(self) -> None:
         cands = self.state["candidates"]
         if len({c["call"] for c in cands}) < 2 or len(cands) < 2:
@@ -661,17 +724,19 @@ class Selector:
         key = fingerprint([(c["id"], c["si"], c["ei"]) for c in cands])
         scores = self.state["rescored"].get(key)
         if scores is None:
-            log(f"select: asking Claude to re-score all {len(cands)} candidates on one scale")
+            log(f"select: asking Claude to rank all {len(cands)} candidates against each other")
             ids = [c["id"] for c in cands]
-            scores = self.claude.ask(SYSTEM_PROMPT, _rescore_prompt(self.title, cands, self.focus),
+            audio = {c["id"]: self._audio_note(c) for c in cands}
+            scores = self.claude.ask(SYSTEM_PROMPT, _rescore_prompt(self.title, cands, self.focus, audio),
                                      lambda r: parse_rescores(r, ids), what="re-scoring")
             self.state["rescored"] = {key: scores}  # only the latest set is ever needed again
             self._save()
         for c in cands:
             sc = dict(scores[c["id"]])
             c["duplicate_of"] = sc.pop("duplicate_of", None)
+            c["order"] = sc.pop("order")
             c["scores"] = sc
-            c["score"] = sum(sc.values())
+            c["score"] = combine(sc)
 
     def _survivors(self) -> list[dict]:
         self._rescore()
@@ -723,7 +788,7 @@ def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, mi
     write_json(work / "clips.json", clips)
     for c in clips:
         log(f"select: #{c['rank']} [{c['score']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} "
-            f"({c['duration']:.0f}s) {c['title']}")
+            f"({c['duration']:.0f}s) {c.get('type') or 'other'}: {c['title']}")
     return clips
 
 

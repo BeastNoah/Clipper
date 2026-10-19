@@ -5,8 +5,9 @@ import pytest
 
 from clipper.llm import Claude, InvalidReply
 from clipper.select import (
-    CHUNK_SECONDS, Timeline, clips_from_review, make_chunks, parse_proposals, parse_rescores,
-    merged_length, resolve_overlaps, saved_candidates, select_clips, snap, snap_and_fit, split_sentences,
+    CHUNK_SECONDS, Timeline, clips_from_review, combine, make_chunks, moment_type, parse_proposals,
+    parse_rescores, merged_length, resolve_overlaps, saved_candidates, select_clips, snap, snap_and_fit,
+    split_sentences,
 )
 from clipper.util import ClipperError
 from conftest import make_words
@@ -78,29 +79,47 @@ def test_resolve_overlaps_keeps_higher_score():
              {"start": 50, "end": 70, "score": 40}]
     kept = resolve_overlaps(cands)
     assert [c["score"] for c in kept] == [80, 40]
+    # Claude's ranking of all candidates, where there is one, beats the scores
+    for c, o in zip(cands, (1, 2, 0)):
+        c["order"] = o
+    assert [c["score"] for c in resolve_overlaps(cands)] == [40, 60]
+
+
+def test_score_multiplies_hook_and_payoff():
+    assert combine({"hook": 10, "payoff": 10, "reaction": 10, "pace": 10}) == 100
+    assert combine({"hook": 0, "payoff": 10, "reaction": 10, "pace": 10}) == 0
+    assert combine({"hook": 5, "payoff": 5, "reaction": 5, "pace": 5}) == 12  # 5*5*5/10
+    # a great hook with a weak payoff loses to a solid clip all round
+    assert combine({"hook": 10, "payoff": 3, "reaction": 8, "pace": 8}) < combine({"hook": 7, "payoff": 7, "reaction": 6, "pace": 6})
+    assert combine({"hook": 8, "payoff": 8, "reaction": 10, "pace": 0}) == 38  # 8*8*6/10
+    assert moment_type(" Hot_Take ") == "hot take" and moment_type("rant") == "other"
 
 
 def test_parse_proposals_reports_problems():
-    good = {"clips": [{"start": 10, "end": 40, "title": "T", "hook": "H",
-                       "scores": {"hook": 20, "standalone": 20, "emotion": 10, "clarity": 15}}]}
-    assert parse_proposals("Here you go:\n```json\n" + json.dumps(good) + "\n```", 0, 100)[0]["start"] == 10
+    good = {"clips": [{"start": 10, "end": 40, "title": "T", "hook": "H", "type": "Joke",
+                       "scores": {"hook": 8, "payoff": 7, "reaction": 5, "pace": 6}}]}
+    got = parse_proposals("Here you go:\n```json\n" + json.dumps(good) + "\n```", 0, 100)[0]
+    assert got["start"] == 10 and got["type"] == "joke"
+    del good["clips"][0]["type"]
+    assert parse_proposals(json.dumps(good), 0, 100)[0]["type"] == "other"
     with pytest.raises(InvalidReply, match="JSON"):
         parse_proposals("no json here", 0, 100)
     bad = json.loads(json.dumps(good))
-    bad["clips"][0]["scores"]["hook"] = 30
-    with pytest.raises(InvalidReply, match="less than or equal to 25"):
+    bad["clips"][0]["scores"]["hook"] = 11
+    with pytest.raises(InvalidReply, match="less than or equal to 10"):
         parse_proposals(json.dumps(bad), 0, 100)
     with pytest.raises(InvalidReply, match="outside"):
         parse_proposals(json.dumps(good), 50, 100)
 
 
 def test_parse_rescores_requires_every_id_once():
-    item = lambda i: {"id": i, "hook": 1, "standalone": 2, "emotion": 3, "clarity": 4}  # noqa: E731
-    assert parse_rescores(json.dumps({"scores": [item("c1"), item("c2")]}), ["c1", "c2"])["c2"]["clarity"] == 4
+    item = lambda i: {"id": i, "hook": 1, "payoff": 2, "reaction": 3, "pace": 4}  # noqa: E731
+    got = parse_rescores(json.dumps({"ranking": [item("c2"), item("c1")]}), ["c1", "c2"])
+    assert got["c2"]["pace"] == 4 and got["c2"]["order"] == 0 and got["c1"]["order"] == 1
     with pytest.raises(InvalidReply, match="missing scores for: c2"):
-        parse_rescores(json.dumps({"scores": [item("c1")]}), ["c1", "c2"])
+        parse_rescores(json.dumps({"ranking": [item("c1")]}), ["c1", "c2"])
     with pytest.raises(InvalidReply, match="more than once"):
-        parse_rescores(json.dumps({"scores": [item("c1"), item("c1"), item("c2")]}), ["c1", "c2"])
+        parse_rescores(json.dumps({"ranking": [item("c1"), item("c1"), item("c2")]}), ["c1", "c2"])
 
 
 def _calls(log):
@@ -119,7 +138,11 @@ def test_long_video_is_chunked_rescored_and_cached(tmp_path, fake_claude):
     assert len(clips) == 4
     assert [c["rank"] for c in clips] == [1, 2, 3, 4]
     assert all(20 <= c["duration"] <= 45 for c in clips)
-    assert all(a["score"] >= b["score"] for a, b in zip(clips, clips[1:]))
+    # the final order is Claude's ranking of all candidates, not the per-part scores
+    state = json.loads((tmp_path / "select.json").read_text())
+    order = {c["id"]: c["order"] for c in state["candidates"]}
+    assert all(order[a["id"]] < order[b["id"]] for a, b in zip(clips, clips[1:]))
+    assert all(c["type"] in ("joke", "story", "hot take") and 0 <= c["score"] <= 100 for c in clips)
     for a in clips:
         for b in clips:
             assert a is b or a["end"] <= b["start"] or b["end"] <= a["start"]

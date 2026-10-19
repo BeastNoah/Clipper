@@ -53,8 +53,9 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   "More settings" has the rest: a time range, formats, translation, logo, zoom, progress bar,
   caption style and more.
 - **Review:** with "Let me review the clips before rendering" ticked, clipper stops after Claude
-  has made its suggestions. Each suggestion shows Claude's score and sub-scores, the hook, the
-  highlight keywords and whether Claude thinks it repeats a better clip. You can preview it in
+  has made its suggestions. Each suggestion shows Claude's score and sub-scores, the kind of moment
+  (joke, story, hot take, …), the hook, the highlight keywords and whether Claude thinks it repeats
+  a better clip. You can preview it in
   the player (for YouTube links that's YouTube's own player, since only the sound has been
   downloaded at that point), tick the ones you want, rename them, and move the start or end by a sentence.
   Click two sentences in the transcript to add a clip of your own.
@@ -160,12 +161,20 @@ model runs at about 7–10x real time there, so a 20-minute video takes 2–3 mi
   carry cues from the audio: `[loud]`, `[+1.8s non-speech sound]` (often laughter or applause)
   and `[pause 2.1s]`, so Claude also notices reactions, not just words.
 - Acting as a short-form video editor, Claude proposes clips, each with a title, the opening hook
-  line, 1–3 keywords to highlight, and a 0–100 score made of four 0–25 sub-scores: hook
-  strength, makes sense on its own, emotion/surprise/humour, and clarity.
+  line, 1–3 keywords to highlight and the kind of moment (joke, story, hot take, insight,
+  confession, roast, relatable). A clip has to make sense on its own, not depend on anything only
+  visible on screen, and have a real ending; anything else isn't proposed at all. Each clip then
+  gets four 0–10 scores for what viewers actually do: **hook** (would a stranger stop scrolling in
+  the first 3 seconds?), **payoff** (does the last line land?), **reaction** (laugh, "wait, what?",
+  share, argue in the comments) and **pace** (no rambling). The 0–100 score is
+  `hook × payoff × (0.6 × reaction + 0.4 × pace) / 10`: hook and payoff multiply, so a weak opener
+  or a clip that trails off can't be made up for elsewhere. Laughter or applause heard after a line
+  counts as evidence for payoff and reaction.
 - Long videos are sent in overlapping 15-minute chunks (the overlap is longer than the longest
   clip, so no moment gets cut in half), up to four at the same time. Claude then sees all
-  candidates together, re-scores them on one common scale and marks any that repeat the point of
-  a better one.
+  candidates together, ranks them against each other (with some variety in the kinds of moment at
+  the top), scores them again on one common scale and marks any that repeat the point of a better
+  one. That ranking decides the final order.
 - clipper moves each start and end to the nearest sentence boundary so no word is cut off. If a
   clip then runs too long, Claude chooses which sentences to keep (so the punchline survives);
   if it's too short, code adds the next sentence. Where clips overlap or repeat each other, the
@@ -216,7 +225,7 @@ work/<video_id>/
   thumb.jpg            the video's thumbnail (links)
   audio.wav            16 kHz mono audio
   transcript.json      every word with its start and end time
-  select.json          Claude's proposals, trims, scores and re-scores (earlier searches too)
+  select.json          Claude's proposals, trims, scores and ranking (earlier searches too)
   clips.json           Claude's picks
   review.json          your picks from the web interface
   posts.json           post text per clip
