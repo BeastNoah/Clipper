@@ -39,7 +39,7 @@ from ..edit import MODES as JUMP_CUT_MODES
 from ..formats import SIZES
 from ..ingest import local_source
 from ..pipeline import (
-    Options, caption_lines, edited_words, find_new_clips, load_video, process, produce_reviewed, rerender,
+    Options, caption_lines, clip_dir_for, edited_words, find_new_clips, load_video, process, produce_reviewed, rerender,
     save_caption_lines,
 )
 from ..reframe import LAYOUTS
@@ -711,7 +711,7 @@ class App:
 
 def edits_name(clip: dict) -> str:
     """Path of a clip's caption corrections, relative to the work folder's clips/ directory."""
-    return f"{round(clip['start'] * 1000):08d}-{round(clip['end'] * 1000):08d}/words_edited.json"
+    return f"{clip_dir_for(Path('.'), clip).name}/words_edited.json"
 
 
 def lan_ip() -> str | None:

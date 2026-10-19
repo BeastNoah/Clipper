@@ -219,6 +219,7 @@ function settingsFields(opts, keys) {
     logo_position: () => sel("logo_position", "Logo position", ["top-right", "top-left", "bottom-right", "bottom-left"]),
     formats,
     zoom: () => chk("zoom", "Auto-zoom on key moments"),
+    earlier_parts: () => chk("earlier_parts", "Claude may add earlier set-up parts"),
     progress_bar: () => chk("progress_bar", "Progress bar"),
     uppercase: () => chk("uppercase", "Capital letters"),
     title_overlay: () => chk("title_overlay", "Title at the start"),
@@ -295,7 +296,7 @@ async function renderHome() {
           "encoder", "download", "logo", "logo_position"])),
         h("div", { style: "margin-top:14px" }, ...settingsFields(opts, ["formats"])),
         h("div", { class: "row", style: "margin-top:14px; gap:22px" }, ...settingsFields(opts, ["uppercase", "title_overlay",
-          "zoom", "progress_bar", "posts"]))),
+          "zoom", "progress_bar", "posts", "earlier_parts"]))),
     ),
     h("section", { id: "jobs-section", hidden: true }, h("h2", {}, "Jobs"), h("div", { class: "jobs", id: "jobs" })),
     h("section", { id: "trending-section" },
@@ -465,7 +466,7 @@ function initReview(v) {
   const cands = [...v.candidates].sort((a, b) => (b.search || 1) - (a.search || 1) || rankOf(a) - rankOf(b) || (b.score ?? 0) - (a.score ?? 0));
   const picked = new Set((v.clips || []).map(c => c.id));
   const items = {};
-  for (const c of cands) items[c.id] = { key: c.id, id: c.id, si: c.si, ei: c.ei, title: c.title, selected: picked.has(c.id), cand: c };
+  for (const c of cands) items[c.id] = { key: c.id, id: c.id, si: c.si, ei: c.ei, before: candBefore(c), title: c.title, selected: picked.has(c.id), cand: c };
   // Edits only make sense for the suggestions they were made on.
   const saved = store.get(reviewKey(v.id), null);
   const fromServer = covers(v.review?.candidates) ? v.review.items : null;
@@ -473,8 +474,8 @@ function initReview(v) {
     for (const k of Object.keys(items)) items[k].selected = false;
     for (const it of list) {
       const key = it.key || it.id || `u${it.si}-${it.ei}`;
-      if (!items[key]) items[key] = { key, id: null, cand: null, title: it.title || sentences[it.si]?.text.slice(0, 50) };
-      Object.assign(items[key], { si: it.si, ei: it.ei, title: it.title ?? items[key].title, selected: it.selected ?? true });
+      if (!items[key]) items[key] = { key, id: null, cand: null, before: [], title: it.title || sentences[it.si]?.text.slice(0, 50) };
+      Object.assign(items[key], { si: it.si, ei: it.ei, before: it.before ?? items[key].before, title: it.title ?? items[key].title, selected: it.selected ?? true });
     }
   };
   let seen = null;
@@ -490,13 +491,34 @@ function initReview(v) {
 
 function persistReview() {
   const r = S.review;
-  store.set(reviewKey(S.video.id), { sig: r.sig, items: r.order.map(k => r.items[k]).filter(it => it.selected || !it.cand || it.si !== it.cand.si || it.ei !== it.cand.ei || it.title !== it.cand.title)
-    .map(({ key, id, si, ei, title, selected }) => ({ key, id, si, ei, title, selected })) });
+  store.set(reviewKey(S.video.id), { sig: r.sig, items: r.order.map(k => r.items[k]).filter(it => it.selected || !it.cand || moved(it) || it.title !== it.cand.title)
+    .map(({ key, id, si, ei, before, title, selected }) => ({ key, id, si, ei, before, title, selected })) });
+}
+
+// Earlier parts: stretches from before the clip (a set-up, the question being answered) that are played
+// first. Kept as [first, last] sentence pairs, in playing order.
+function candBefore(c) {
+  return (c.before || []).map(p => [p.si, p.ei]);
+}
+
+function moved(it) {
+  const c = it.cand;
+  return c && (it.si !== c.si || it.ei !== c.ei || JSON.stringify(it.before || []) !== JSON.stringify(candBefore(c)));
 }
 
 function span(it) {
   const s = S.video.sentences;
   return { start: s[it.si].start, end: s[it.ei].end };
+}
+
+// Every part of a clip in playing order, with times: its earlier parts, then the clip itself.
+function itemParts(it) {
+  const s = S.video.sentences;
+  return [...(it.before || []), [it.si, it.ei]].map(([a, b]) => ({ si: a, ei: b, start: s[a].start, end: s[b].end }));
+}
+
+function itemLength(it) {
+  return itemParts(it).reduce((t, p) => t + p.end - p.start, 0);
 }
 
 let videoRequest = 0;
@@ -553,7 +575,7 @@ function reviewView() {
     h("div", { class: "panel player-panel", style: "padding:12px" }, player, h("div", { class: "preview-label", id: "preview-label", style: "margin-top:8px" }, "Click ▶ on a clip to preview it here.")),
     h("div", { class: "panel transcript-panel", style: "padding:12px 8px" },
       h("div", { class: "row", style: "padding:0 8px 8px" }, h("h2", { style: "margin:0" }, "Transcript"),
-        h("span", { class: "small muted grow" }, "Click a sentence to start your own clip, then click where it should end.")),
+        h("span", { class: "small muted grow" }, "Click a sentence to start your own clip, then click where it should end. After previewing a clip, a stretch marked before it can be played in front of it.")),
       h("div", { class: "transcript", id: "transcript" }),
       h("div", { class: "custom-bar", id: "custom-bar", style: "padding:0 8px" })));
 
@@ -598,7 +620,8 @@ function findPanel() {
     focus,
     h("div", { class: "quick" }, ...settingsFields(options(), ["num_clips", "min_len", "max_len"])),
     h("details", {}, h("summary", {}, "More"),
-      h("div", { class: "settings" }, ...settingsFields(options(), ["range_start", "range_end", "model"]))),
+      h("div", { class: "settings" }, ...settingsFields(options(), ["range_start", "range_end", "model"])),
+      h("div", { class: "row", style: "margin-top:10px" }, ...settingsFields(options(), ["earlier_parts"]))),
     h("div", { class: "row" },
       h("label", { class: "check grow" }, render, "Render them right away"), button));
 }
@@ -621,7 +644,10 @@ function makePlayer(v) {
     el.addEventListener("error", () => { if (!el.src.endsWith("audio.wav")) el.src = audio; });
   }
   el.addEventListener("timeupdate", () => {
-    if (S.stopAt != null && el.currentTime >= S.stopAt) { el.pause(); S.stopAt = null; }
+    if (S.stopAt == null || el.currentTime < S.stopAt) return;
+    const next = S.playQueue?.shift();  // the next part of a clip with earlier parts
+    if (next) { el.currentTime = Math.max(0, next.start - 0.2); S.stopAt = next.end + 0.4; }
+    else { el.pause(); S.stopAt = null; }
   });
   return el;
 }
@@ -632,10 +658,17 @@ function youtubeSrc(id, start, end, autoplay) {
   return `https://www.youtube-nocookie.com/embed/${encodeURIComponent(id)}?${q}`;
 }
 
-function seekPlayer(t, stopAt, play) {
+function seekPlayer(t, stopAt, play, queue = []) {
   const p = $("#player");
   if (!p) return;
+  clearTimeout(S.playTimer);
+  S.playQueue = queue;
   if (p.tagName === "IFRAME") {
+    // YouTube's player can't be told what to play next: switch to the next part once this one has played.
+    if (queue.length && stopAt != null) {
+      S.playTimer = setTimeout(() => { const n = queue[0]; seekPlayer(n.start - 0.2, n.end + 0.4, true, queue.slice(1)); },
+        (stopAt - t) * 1000 + 1500);
+    }
     p.src = youtubeSrc(S.video.meta.youtube_id, t, stopAt, play);
     return;
   }
@@ -645,11 +678,12 @@ function seekPlayer(t, stopAt, play) {
 }
 
 function preview(it, n) {
-  const { start, end } = span(it);
-  seekPlayer(start - 0.2, end + 0.4, true);
-  $("#preview-label").textContent = `Previewing ${n ? `#${n}` : ""} “${it.title}” · ${fmt(start)}–${fmt(end)}`;
-  S.review.focus = it.key;
+  const [first, ...rest] = itemParts(it);
+  seekPlayer(first.start - 0.2, first.end + 0.4, true, rest);
+  $("#preview-label").textContent = `Previewing ${n ? `#${n}` : ""} “${it.title}” · ` + itemParts(it).map(p => `${fmt(p.start)}–${fmt(p.end)}`).join(" + ");
+  S.review.focus = S.review.lastFocus = it.key;
   renderTranscript(true);
+  renderCustomBar();
 }
 
 function candView(it, n) {
@@ -659,7 +693,16 @@ function candView(it, n) {
   const change = (fn) => () => { fn(); persistReview(); renderCands(); renderRenderBar(); if (S.review.focus === it.key) renderTranscript(); };
   const subs = c?.scores ? h("div", { class: "subs" }, [["hook", "Hook"], ["payoff", "Payoff"], ["reaction", "Reaction"], ["pace", "Pace"]].map(([k, label]) =>
     h("div", { class: "sub" }, `${label} ${c.scores[k] ?? "–"}`, h("div", { class: "bar" }, h("i", { style: `width:${((c.scores[k] ?? 0) / 10) * 100}%` }))))) : null;
-  const moved = c && (it.si !== c.si || it.ei !== c.ei);
+  const adjusted = moved(it);
+  const before = it.before || [];
+  const floor = before.length ? Math.max(...before.map(p => p[1])) + 1 : 0;  // the clip can't start inside an earlier part
+  const earlier = before.length ? h("div", { class: "earlier" },
+    h("div", { class: "small muted" }, `Played first (earlier in the video):`),
+    ...itemParts(it).slice(0, -1).map((p, k) => h("div", { class: "earlier-part" },
+      h("button", { class: "btn ghost small", title: "Preview this part", onclick: () => seekPlayer(p.start - 0.2, p.end + 0.4, true) }, `▶ ${fmt(p.start)}–${fmt(p.end)}`),
+      h("span", { class: "small grow" }, S.video.sentences.slice(p.si, p.ei + 1).map(s => s.text).join(" ")),
+      h("button", { class: "btn ghost small danger", title: "Leave this part out", "aria-label": "Remove this earlier part",
+        onclick: change(() => { it.before = before.filter((_, j) => j !== k); }) }, "×")))) : null;
   return h("div", { class: "cand" + (it.selected ? " selected" : "") + (c?.duplicate_of ? " dimmed" : "") },
     h("input", { type: "checkbox", "aria-label": "Use this clip", checked: it.selected, onchange: e => { it.selected = e.target.checked; persistReview(); renderCands(); renderRenderBar(); } }),
     h("div", { class: "thumb", style: `background-image:url('/api/videos/${S.video.id}/frame?t=${Math.round(start + 1)}')` }),
@@ -668,8 +711,9 @@ function candView(it, n) {
       h("div", { class: "meta" },
         c?.score != null ? h("span", { class: "score", title: "Claude's score out of 100: hook × payoff × (reaction and pace)" }, c.score) : h("span", { class: "badge" }, "your clip"),
         c?.type && c.type !== "other" ? h("span", { class: "chip", title: "The kind of moment" }, c.type) : null,
-        h("span", {}, `${fmt(start)}–${fmt(end)}`), h("span", {}, `${Math.round(end - start)}s`),
-        moved ? h("span", { class: "chip" }, "adjusted") : null),
+        h("span", {}, `${fmt(start)}–${fmt(end)}`), h("span", {}, `${Math.round(itemLength(it))}s`),
+        before.length ? h("span", { class: "chip", title: "Earlier parts of the video are played before this clip" }, `+${before.length} earlier part${before.length === 1 ? "" : "s"}`) : null,
+        adjusted ? h("span", { class: "chip" }, "adjusted") : null),
       subs,
       c?.hook ? h("div", { class: "hook" }, `“${c.hook}”`) : null,
       h("div", { class: "chips" },
@@ -681,15 +725,16 @@ function candView(it, n) {
       h("div", { class: "actions" },
         h("button", { class: "btn icon", onclick: () => preview(it, n), "aria-label": "Preview" }, "▶ Preview"),
         h("span", { class: "nudge" }, "Start",
-          h("button", { class: "btn", title: "One sentence earlier", disabled: it.si <= 0, onclick: change(() => it.si--) }, "◀"),
+          h("button", { class: "btn", title: "One sentence earlier", disabled: it.si <= floor, onclick: change(() => it.si--) }, "◀"),
           h("button", { class: "btn", title: "One sentence later", disabled: it.si >= it.ei, onclick: change(() => it.si++) }, "▶")),
         h("span", { class: "nudge" }, "End",
           h("button", { class: "btn", title: "One sentence earlier", disabled: it.ei <= it.si, onclick: change(() => it.ei--) }, "◀"),
           h("button", { class: "btn", title: "One sentence later", disabled: it.ei >= nS - 1, onclick: change(() => it.ei++) }, "▶")),
-        moved ? h("button", { class: "btn ghost small", onclick: change(() => { it.si = c.si; it.ei = c.ei; }) }, "Reset") : null,
+        adjusted ? h("button", { class: "btn ghost small", onclick: change(() => { it.si = c.si; it.ei = c.ei; it.before = candBefore(c); }) }, "Reset") : null,
         !c ? h("button", { class: "btn ghost danger", onclick: change(() => { delete S.review.items[it.key]; S.review.order = S.review.order.filter(k => k !== it.key); }) }, "Remove") : null),
+      earlier,
       h("details", { class: "cand-text" }, h("summary", {}, "Transcript"),
-        S.video.sentences.slice(it.si, it.ei + 1).map(s => s.text).join(" "))));
+        itemParts(it).map(p => S.video.sentences.slice(p.si, p.ei + 1).map(s => s.text).join(" ")).join(" … "))));
 }
 
 function renderCands() {
@@ -712,11 +757,11 @@ function renderTranscript(scroll) {
   const lo = r.mark ?? -1, hi = r.markEnd ?? r.mark ?? -1;
   let target = null;
   box.replaceChildren(...S.video.sentences.map(s => {
-    const inFocus = focus && s.i >= focus.si && s.i <= focus.ei;
+    const inFocus = focus && itemParts(focus).some(p => s.i >= p.si && s.i <= p.ei);
     const inMark = s.i >= lo && s.i <= hi && lo >= 0;
     const el = h("button", { class: "sent" + (inFocus || inMark ? " in" : "") + (s.i === r.mark ? " mark" : ""),
       onclick: () => clickSentence(s.i) }, h("span", { class: "t" }, fmt(s.start)), s.text);
-    if ((inFocus && focus.si === s.i) || (inMark && s.i === lo)) target = target || el;
+    if ((inFocus && itemParts(focus)[0].si === s.i) || (inMark && s.i === lo)) target = target || el;
     return el;
   }));
   if (scroll && target) box.scrollTop = target.offsetTop - box.offsetTop - 40;
@@ -739,6 +784,9 @@ function renderCustomBar() {
   if (r.mark == null) { box.replaceChildren(); return; }
   const end = r.markEnd ?? r.mark;
   const dur = s[end].end - s[r.mark].start;
+  // A stretch before a clip can be played in front of it, e.g. the set-up its punchline needs.
+  const target = r.markEnd != null && r.lastFocus && r.items[r.lastFocus];
+  const fits = target && end < target.si && !(target.before || []).some(([a, b]) => r.mark <= b && end >= a);
   box.replaceChildren(
     h("span", { class: "small" }, r.markEnd == null ? `Start: ${fmt(s[r.mark].start)} · now click the last sentence` : `${fmt(s[r.mark].start)}–${fmt(s[end].end)} · ${Math.round(dur)}s`),
     r.markEnd != null ? h("button", { class: "btn primary", onclick: () => {
@@ -749,6 +797,12 @@ function renderCustomBar() {
       persistReview(); renderCands(); renderTranscript(); renderCustomBar(); renderRenderBar();
       toast("Clip added");
     } }, "Add as clip") : null,
+    fits ? h("button", { class: "btn", title: "Play this part first, before the clip", onclick: () => {
+      target.before = [...(target.before || []), [r.mark, end]].sort((x, y) => x[0] - y[0]);
+      r.mark = r.markEnd = null;
+      persistReview(); renderCands(); renderTranscript(); renderCustomBar(); renderRenderBar();
+      toast("Added in front of the clip");
+    } }, `Play before “${target.title.slice(0, 30)}”`) : null,
     h("button", { class: "btn ghost", onclick: () => { r.mark = r.markEnd = null; renderTranscript(); renderCustomBar(); } }, "Clear"));
 }
 
@@ -757,7 +811,7 @@ function renderRenderBar() {
   if (!box) return;
   const r = S.review;
   const chosen = r.order.map(k => r.items[k]).filter(it => it.selected);
-  const total = chosen.reduce((a, it) => { const { start, end } = span(it); return a + end - start; }, 0);
+  const total = chosen.reduce((a, it) => a + itemLength(it), 0);
   const opts = options();
   const running = S.jobs.some(j => j.video === S.video.id && (j.state === "running" || j.state === "queued"));
   box.replaceChildren(h("div", { class: "inner" },
@@ -775,7 +829,7 @@ function renderRenderBar() {
 async function renderClips(chosen) {
   try {
     await api.post("/api/jobs", { kind: "render", video: S.video.id, options: options(),
-      items: chosen.map(it => ({ id: it.id, si: it.si, ei: it.ei, title: it.title })) });
+      items: chosen.map(it => ({ id: it.id, si: it.si, ei: it.ei, title: it.title, before: it.before || [] })) });
     toast("Rendering started");
     S.tab = "clips";
     renderVideo();

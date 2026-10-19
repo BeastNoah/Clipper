@@ -5,6 +5,8 @@ FAKE_CLAUDE_LOG: append each call (argv + prompt) as a JSON line.
 FAKE_CLAUDE_BAD_FIRST=1: the first answer in a conversation is malformed, to exercise the retry.
 FAKE_CLAUDE_MAX: propose at most this many clips per request.
 FAKE_CLAUDE_LONG=1: propose clips that run past the maximum length (so clipper asks for a trim).
+FAKE_CLAUDE_BEFORE=1: the first clip starts at the fourth line and plays the first line before it (an
+    earlier part, like a joke's set-up).
 FAKE_CLAUDE_DUP=1: when re-scoring, mark the second clip as a duplicate of the first.
 FAKE_CLAUDE_SLEEP: seconds to think before answering a request for clips.
 FAKE_CLAUDE_FAILS: a file holding a number; while it's above 0, fail (and count down) like a crashed CLI.
@@ -63,7 +65,8 @@ if "<transcript>" in prompt:
     count = int(re.search(r"Find up to (\d+)", prompt)[1])
     count = min(count, int(os.environ.get("FAKE_CLAUDE_MAX", "99")))
     avoid = [(float(a), float(b)) for a, b in re.findall(r"^- ([\d.]+)-([\d.]+)$", prompt, re.M)]
-    clips, i = [], 0
+    before = os.environ.get("FAKE_CLAUDE_BEFORE") and "Earlier parts:" in prompt and len(lines) > 3
+    clips, i = [], 3 if before else 0
     while i < len(lines) and len(clips) < count:
         s = lines[i][0]
         j = i
@@ -78,6 +81,9 @@ if "<transcript>" in prompt:
                           "type": ["joke", "story", "hot take"][n % 3],
                           "scores": {"hook": 4 + n % 6, "payoff": 6, "reaction": 5, "pace": 8},
                           "keywords": [lines[i][2].split()[-1].strip(".,!?")]})
+            if before and n == 0:
+                clips[0]["before"] = [{"start": lines[0][0], "end": lines[0][1]}]
+                clips[0]["scores"]["hook"] = 10  # the set-up makes it the best one
         i = j + 2
     reply({"clips": clips})
 
@@ -102,9 +108,10 @@ if "<lines>" in prompt:
     reply({"title": f"[EN] {title}", "lines": [f"[EN] {l}" for l in lines]})
 
 if '<clip id="' in prompt:
-    lo, hi = map(float, re.search(r"make it (\d+)-(\d+) seconds", prompt).groups())
     trims = []
-    for tid, body in re.findall(r'<clip id="(\w+)"[^>]*>\n(.*?)\n</clip>', prompt, re.S):
+    for tid, attrs, body in re.findall(r'<clip id="(\w+)"([^>]*)>\n(.*?)\n</clip>', prompt, re.S):
+        own = re.search(r'seconds="(\d+)-(\d+)"', attrs)  # played after earlier parts: a length of its own
+        lo, hi = map(float, (own or re.search(r"make it (\d+)-(\d+) seconds", prompt)).groups())
         times = [tuple(map(float, m)) for m in re.findall(r"^\d+\. \[([\d.]+)-([\d.]+)\]", body, re.M)]
         # keep from line 2 (pretend the first line is a weak opener) until the clip is long enough
         first = 2 if len(times) > 2 and times[-1][1] - times[1][0] >= lo else 1

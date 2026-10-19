@@ -68,7 +68,7 @@ def test_a_filler_right_after_a_word_is_cut_completely():
 def test_caption_lines_say_where_they_play_after_the_jump_cuts(tmp_path):
     from clipper.pipeline import caption_lines, clip_dir_for
     from clipper.util import write_json
-    clip = {"start": 10.0, "end": 20.0, "segments": [[0.0, 2.0], [5.0, 10.0]]}  # 2s-5s cut out
+    clip = {"start": 10.0, "end": 20.0, "timeline": [[10.0, 12.0, 0.0], [15.0, 20.0, 2.0]]}  # 12s-15s cut out
     words = [{"w": "First", "s": 10.5, "e": 11.0}, {"w": "line.", "s": 11.0, "e": 11.5},
              {"w": "Second", "s": 16.0, "e": 16.5}, {"w": "line.", "s": 16.5, "e": 17.0}]
     cdir = clip_dir_for(tmp_path, clip)
@@ -76,5 +76,12 @@ def test_caption_lines_say_where_they_play_after_the_jump_cuts(tmp_path):
     write_json(cdir / "words.json", {"result": words})
     lines = caption_lines(tmp_path, clip)
     assert [(l["at"], l["until"]) for l in lines] == [(0.5, 1.5), (3.0, 4.0)]
-    del clip["segments"]  # rendered before the cuts were kept: time from the clip's start
+    del clip["timeline"]  # rendered before the cuts were kept: time from the clip's start
     assert caption_lines(tmp_path, clip)[1]["at"] == 6.0
+
+
+def test_play_time_of_a_clip_with_an_earlier_part():
+    from clipper.pipeline import play_time
+    # 5-7 plays first, then 30-40 (with 32-34 cut out)
+    clip = {"start": 30.0, "end": 40.0, "timeline": [[5.0, 7.0, 0.0], [30.0, 32.0, 2.0], [34.0, 40.0, 4.0]]}
+    assert [play_time(clip, t) for t in (6.0, 31.0, 33.0, 35.0, 45.0)] == [1.0, 3.0, 4.0, 5.0, 10.0]

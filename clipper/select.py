@@ -26,6 +26,8 @@ SENTENCE_GAP = 2.0           # a pause this long ends a sentence even without pu
 PAD_BEFORE, PAD_AFTER = 0.2, 0.4
 EXTRA_ROUNDS = 2             # how many times to ask Claude for more when too few clips survive
 CLAUDE_AT_ONCE = 4           # requests in flight at the same time for the parts of a long video
+MAX_EARLIER_PARTS = 3        # earlier parts (a set-up, a callback, montage moments) played before a clip
+MIN_MAIN_PART = 4.0          # seconds the clip's own moment keeps, however long its earlier parts
 
 _END = (".", "?", "!", "…", "。", "？", "！")
 _TRAILING = "\"'”’)»]"
@@ -171,9 +173,15 @@ def moment_type(value: str) -> str:
     return t if t in MOMENT_TYPES else "other"
 
 
+class Span(BaseModel):
+    start: float
+    end: float
+
+
 class ProposedClip(BaseModel):
     start: float
     end: float
+    before: list[Span] = Field(default_factory=list, max_length=MAX_EARLIER_PARTS)
     title: str = Field(min_length=1, max_length=120)
     hook: str = Field(min_length=1)
     type: str = "other"
@@ -225,6 +233,15 @@ def parse_proposals(reply: str, lo: float, hi: float) -> list[dict]:
         elif c.start < lo - 2 or c.end > hi + 2:
             problems.append(f"clips[{n - 1}]: {c.start}-{c.end} is outside this part of the transcript "
                             f"({lo:.1f}-{hi:.1f}); use times from the lines above")
+        for b in c.before:
+            if b.end <= b.start:
+                problems.append(f"clips[{n - 1}].before: end ({b.end}) must be after start ({b.start})")
+            elif b.end > c.start + 1:
+                problems.append(f"clips[{n - 1}].before: {b.start}-{b.end} must end before the clip starts "
+                                f"({c.start}); earlier parts come from earlier in the video")
+            elif b.start < lo - 2:
+                problems.append(f"clips[{n - 1}].before: {b.start}-{b.end} is outside this part of the "
+                                f"transcript ({lo:.1f}-{hi:.1f}); use times from the lines above")
     if problems:
         raise InvalidReply("\n".join(problems))
     return [c.model_dump() for c in parsed.clips]
@@ -252,9 +269,10 @@ def parse_rescores(reply: str, ids: list[str]) -> dict[str, dict]:
     return {s.id: {**s.model_dump(exclude={"id"}), "order": n} for n, s in enumerate(parsed.ranking)}
 
 
-def parse_trims(reply: str, jobs: dict[str, tuple[int, int]], tl: "Timeline", min_len: float,
+def parse_trims(reply: str, jobs: dict[str, tuple[int, int, float]], tl: "Timeline", min_len: float,
                 max_len: float) -> dict[str, tuple[int, int]]:
-    """Validate Claude's choice of which lines to keep: {trim id: (first, last)} with 1-based lines."""
+    """Validate Claude's choice of which lines to keep: {trim id: (first, last)} with 1-based lines.
+    jobs: {trim id: (first sentence, last sentence, seconds of earlier parts played before them)}."""
     parsed = _validate(TrimReply, reply)
     got = {t.id: t for t in parsed.trims}
     problems = []
@@ -265,15 +283,16 @@ def parse_trims(reply: str, jobs: dict[str, tuple[int, int]], tl: "Timeline", mi
         if tid not in jobs:
             problems.append(f"unknown id {tid}")
             continue
-        si, ei = jobs[tid]
+        si, ei, extra = jobs[tid]
         n = ei - si + 1
         if not 1 <= t.first <= t.last <= n:
             problems.append(f"{tid}: first and last must be line numbers with 1 <= first <= last <= {n}")
             continue
         length = tl.sentences[si + t.last - 1].end - tl.sentences[si + t.first - 1].start
-        if not min_len <= length <= max_len - 0.6:
+        lo, hi = main_limits(min_len, max_len, extra)
+        if not lo <= length <= hi - 0.6:
             problems.append(f"{tid}: lines {t.first}-{t.last} run {length:.1f}s, which is outside "
-                            f"{min_len:.0f}-{max_len - 1:.0f}s")
+                            f"{lo:.0f}-{hi - 1:.0f}s")
     if problems:
         raise InvalidReply("; ".join(problems))
     return {tid: (t.first, t.last) for tid, t in got.items()}
@@ -322,12 +341,15 @@ def snap(tl: Timeline, start: float, end: float) -> tuple[int, int]:
     return si, tl.nearest_end(end, si)
 
 
-def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float) -> tuple[int, int] | None:
+def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float,
+        floor: int | None = None) -> tuple[int, int] | None:
     """Trim or extend sentences si..ei to fit the length limits.
 
     Trimming happens at the end (the start holds the hook). Extending adds the next sentence,
-    or the previous one when there is no room after. Returns None if the clip can't be made to fit.
+    or the previous one when there is no room after (but never before `floor`). Returns None if
+    the clip can't be made to fit.
     """
+    floor = tl.lo if floor is None else max(floor, tl.lo)
     while ei > si and tl.dur(si, ei) > max_len:
         ei -= 1
     if tl.dur(si, ei) > max_len:
@@ -335,7 +357,7 @@ def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float) -> tuple
     while tl.dur(si, ei) < min_len:
         if ei + 1 <= tl.hi and tl.dur(si, ei + 1) <= max_len:
             ei += 1
-        elif si > tl.lo and tl.dur(si - 1, ei) <= max_len:
+        elif si > floor and tl.dur(si - 1, ei) <= max_len:
             si -= 1
         else:
             return None
@@ -344,6 +366,26 @@ def fit(tl: Timeline, si: int, ei: int, min_len: float, max_len: float) -> tuple
 
 def snap_and_fit(tl: Timeline, start: float, end: float, min_len: float, max_len: float) -> tuple[int, int] | None:
     return fit(tl, *snap(tl, start, end), min_len, max_len)
+
+
+def main_limits(min_len: float, max_len: float, extra: float) -> tuple[float, float]:
+    """Length limits for a clip's own moment when `extra` seconds of earlier parts play before it."""
+    return max(min(MIN_MAIN_PART, min_len), min_len - extra), max_len - extra
+
+
+def part_record(tl: Timeline, si: int, ei: int) -> dict:
+    return {"si": si, "ei": ei, "start": round(tl.clip_start(si), 3), "end": round(tl.clip_end(ei), 3)}
+
+
+def clip_parts(clip: dict) -> list[dict]:
+    """The stretches of the video a clip is made of, in the order they are played: its earlier parts
+    (a set-up, the question being answered, montage moments), then its own moment (start-end)."""
+    main = {k: clip[k] for k in ("si", "ei", "start", "end") if k in clip}
+    return [*clip.get("before", []), main]
+
+
+def clip_spans(clip: dict) -> list[tuple[float, float]]:
+    return [(p["start"], p["end"]) for p in clip_parts(clip)]
 
 
 def merged_length(spans: list[tuple[float, float]], lo: float, hi: float) -> float:
@@ -363,12 +405,17 @@ def rank_key(c: dict) -> tuple:
     return (math.inf if order is None else order, -c["score"], c["start"])
 
 
+def _overlap(a: dict, b: dict) -> bool:
+    return any(s < y and e > x for s, e in clip_spans(a) for x, y in clip_spans(b))
+
+
 def resolve_overlaps(cands: list[dict]) -> list[dict]:
-    """Where clips overlap, or Claude marked two as telling the same story, keep the better-ranked one."""
+    """Where clips overlap (any of their parts), or Claude marked two as telling the same story, keep the
+    better-ranked one."""
     kept: list[dict] = []
     for c in sorted(cands, key=rank_key):
         clash = any(
-            not (c["end"] <= k["start"] or c["start"] >= k["end"])
+            _overlap(c, k)
             or (c.get("duplicate_of") is not None and c.get("duplicate_of") == k.get("id"))
             or (k.get("duplicate_of") is not None and k.get("duplicate_of") == c.get("id"))
             for k in kept
@@ -378,14 +425,24 @@ def resolve_overlaps(cands: list[dict]) -> list[dict]:
     return kept
 
 
+def parts_text(tl: Timeline, before: list[tuple[int, int]], si: int, ei: int) -> str:
+    """The clip's words in playing order; " … " marks a jump from one part of the video to another."""
+    return " … ".join(tl.text(a, b) for a, b in [*before, (si, ei)])
+
+
 def make_clip(tl: Timeline, rank: int, si: int, ei: int, base: dict | None = None,
-              title: str | None = None) -> dict:
-    """The clip record used by every later step (also for clips picked or edited in the UI)."""
+              title: str | None = None, before: list[tuple[int, int]] | None = None) -> dict:
+    """The clip record used by every later step (also for clips picked or edited in the UI). before: the
+    earlier parts played first, as (first, last) sentences; by default the ones of `base`."""
     base = base or {}
-    text = tl.text(si, ei)
+    if before is None:
+        before = [(p["si"], p["ei"]) for p in base.get("before", [])]
+    before = [(a, b) for a, b in before if b < si]
+    text = parts_text(tl, before, si, ei)
     start, end = round(tl.clip_start(si), 3), round(tl.clip_end(ei), 3)
+    parts = [part_record(tl, a, b) for a, b in before]
     same_start = base.get("si") == si
-    return {
+    clip = {
         "rank": rank,
         "id": base.get("id") or f"u{si}-{ei}",
         "title": (title or base.get("title") or tl.sentences[si].text[:50]).strip(),
@@ -393,11 +450,15 @@ def make_clip(tl: Timeline, rank: int, si: int, ei: int, base: dict | None = Non
         "type": base.get("type"),
         "score": base.get("score"),
         "scores": base.get("scores"),
-        "start": start, "end": end, "duration": round(end - start, 3),
+        "start": start, "end": end,
+        "duration": round(end - start + sum(p["end"] - p["start"] for p in parts), 3),
         "si": si, "ei": ei,
         "text": text,
         "keywords": [k for k in base.get("keywords", []) if k.lower() in text.lower()],
     }
+    if parts:
+        clip["before"] = parts
+    return clip
 
 
 def timeline_for(transcript: dict, meta: dict) -> Timeline:
@@ -414,9 +475,22 @@ noticeably louder than usual; [+1.8s non-speech sound] means a sound without spe
 (often laughter or applause); [pause 2.1s] means silence follows."""
 
 
+EARLIER_NOTE = """\
+Earlier parts: sometimes a moment only lands because of something said before it: the set-up of a \
+joke or a callback, the question that is being answered, the fact or name the punchline depends on. \
+Then add that earlier stretch to the clip in "before": one or a few whole lines from earlier in this \
+transcript, with the start time of the first line and the end time of the last, exactly as written. \
+They are played first, in the order you list them, and the clip (start-end) follows straight after; \
+the viewer gets the set-up, then the payoff, without the minutes in between. The same works for a \
+montage: several short moments on one theme, the strongest one last as the clip itself. Use at most \
+{n} earlier parts, keep each one short, and only add them when the clip clearly needs them or becomes \
+much better; most clips have none ("before": []). The length limit counts all parts together.""".format(
+    n=MAX_EARLIER_PARTS)
+
+
 def _proposal_prompt(title: str, tl: Timeline, a: int, b: int, count: int, min_len: float,
                      max_len: float, avoid: list[tuple[float, float]], cues: dict[int, str],
-                     focus: str | None = None) -> str:
+                     focus: str | None = None, earlier: bool = True) -> str:
     lines = "\n".join(f"{s.start:.1f}-{s.end:.1f} | {s.text}{cues.get(s.i, '')}" for s in tl.sentences[a:b + 1])
     has_cues = any(i in cues for i in range(a, b + 1))
     lo, hi = tl.sentences[a].start, tl.sentences[b].end
@@ -430,6 +504,8 @@ def _proposal_prompt(title: str, tl: Timeline, a: int, b: int, count: int, min_l
     if focus:
         focus_txt = (f"\nThe person making the clips is looking for: {focus.strip()}\nOnly propose moments that "
                      "fit this. If nothing in this part fits, return an empty list.\n")
+    earlier_txt = f"\n{EARLIER_NOTE}\n" if earlier else ""
+    example_before = ' "before": [{"start": 61.2, "end": 66.8}],' if earlier else ""
     return f"""\
 Video title: {title}
 {focus_txt}
@@ -447,11 +523,11 @@ Find up to {count} of the best moments in this part to cut into standalone short
 - Clips must not overlap each other, and each must be about a different point or story.
 - Use the start time of the clip's first line and the end time of its last line, exactly as written.
 - Only propose clips that are genuinely good. Fewer is fine; an empty list is fine.
-{avoid_txt}
+{avoid_txt}{earlier_txt}
 {RUBRIC}
 
 Reply with only a JSON object in exactly this format:
-{{"clips": [{{"start": 123.4, "end": 161.0, "title": "Short catchy title", \
+{{"clips": [{{"start": 123.4, "end": 161.0,{example_before} "title": "Short catchy title", \
 "hook": "The opening line, quoted from the transcript", "type": "joke", \
 "scores": {{"hook": 8, "payoff": 7, "reaction": 6, "pace": 8}}, \
 "keywords": ["the word that lands"]}}]}}
@@ -466,9 +542,14 @@ def _rescore_prompt(title: str, cands: list[dict], focus: str | None = None,
     audio = audio or {}
     focus_txt = (f"\n\nThe person making the clips is looking for: {focus}. Clips that don't fit this "
                  "go to the bottom.") if focus else ""
+    def when(c: dict) -> str:
+        parts = clip_parts(c)
+        length = sum(p["end"] - p["start"] for p in parts)
+        spans = " + ".join(f"{fmt_time(p['start'])}-{fmt_time(p['end'])}" for p in parts)
+        return f"{spans} ({length:.0f}s{', earlier parts played first' if len(parts) > 1 else ''})"
+
     blocks = "\n\n".join(
-        f"[{c['id']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} ({c['end'] - c['start']:.0f}s) "
-        f"{c.get('type') or 'other'} \"{c['title']}\"\n{c['text']}"
+        f"[{c['id']}] {when(c)} {c.get('type') or 'other'} \"{c['title']}\"\n{c['text']}"
         + (f"\n({audio[c['id']]})" if audio.get(c["id"]) else "")
         for c in cands
     )
@@ -486,7 +567,8 @@ other goes down the list, so the top of the ranking has some variety.{focus_txt}
 <clips>
 {blocks}
 </clips>
-{"Notes in brackets under a clip say what the audio shows inside it." if audio else ""}
+{"Notes in brackets under a clip say what the audio shows inside it." if audio else ""}\
+{" Where a clip jumps from an earlier part of the video to a later one, its text shows … there." if any(c.get("before") for c in cands) else ""}
 If a clip makes the same point or tells the same story as a better clip in the list, set its \
 "duplicate_of" to that better clip's id; otherwise set it to null.
 
@@ -496,21 +578,26 @@ this format:
 "duplicate_of": null}}]}}"""
 
 
-def _trim_prompt(title: str, tl: Timeline, jobs: dict[str, tuple[int, int, str]], min_len: float,
+def _trim_prompt(title: str, tl: Timeline, jobs: dict[str, tuple[int, int, str, float]], min_len: float,
                  max_len: float) -> str:
+    """jobs: {trim id: (first sentence, last sentence, title, seconds of earlier parts played first)}."""
     blocks = []
-    for tid, (si, ei, clip_title) in jobs.items():
+    for tid, (si, ei, clip_title, extra) in jobs.items():
         t0 = tl.sentences[si].start
         lines = "\n".join(f"{n}. [{s.start - t0:.1f}-{s.end - t0:.1f}] {s.text}"
                           for n, s in enumerate(tl.sentences[si:ei + 1], 1))
-        blocks.append(f'<clip id="{tid}" title="{clip_title}">\n{lines}\n</clip>')
+        lo, hi = main_limits(min_len, max_len, extra)
+        length = f' seconds="{lo:.0f}-{hi - 1:.0f}"' if extra else ""
+        blocks.append(f'<clip id="{tid}" title="{clip_title}"{length}>\n{lines}\n</clip>')
     example = next(iter(jobs))
     return f"""\
 Video title: {title}
 
 These clips came out too long once aligned to whole sentences. For each one, choose a single \
 continuous run of its numbered lines to keep: start on a strong hook, keep the payoff, and make \
-it {min_len:.0f}-{max_len - 1:.0f} seconds long (the times are seconds from the start of the clip).
+it {min_len:.0f}-{max_len - 1:.0f} seconds long (the times are seconds from the start of the clip). \
+A clip marked with seconds="..." is played after earlier parts of the video; its kept lines must be \
+that long instead.
 
 {chr(10).join(blocks)}
 
@@ -522,9 +609,9 @@ class Selector:
     def __init__(self, work: Path, meta: dict, transcript: dict, *, min_len: float, max_len: float,
                  model: str, claude_factory: Callable[[], Claude], force: bool = False,
                  focus: str | None = None, time_range: tuple[float | None, float | None] = (None, None),
-                 new_search: bool = False, also_avoid: list[tuple[float, float]] = ()):
+                 new_search: bool = False, also_avoid: list[tuple[float, float]] = (), earlier: bool = True):
         """new_search: ask for clips at moments not suggested yet (nor in also_avoid), even if these
-        options were used before."""
+        options were used before. earlier: Claude may put earlier parts of the video in front of a clip."""
         words = transcript["words"]
         self.sentences = split_sentences(words)
         if not self.sentences:
@@ -539,6 +626,7 @@ class Selector:
             raise ClipperError(f"No speech between {fmt_time(lo or 0)} and {fmt_time(hi or meta['duration'])}.")
         self.tl = Timeline(self.sentences, words, meta["duration"], pool[0].i, pool[-1].i)
         self.focus = (focus or "").strip() or None
+        self.earlier = earlier
         self.chunks = make_chunks(pool, overlap=max_len + 30)
         self._claude_factory, self._claude = claude_factory, None
         self._pending: list[tuple[dict, str, int, int]] = []
@@ -546,6 +634,8 @@ class Selector:
         params = {"version": SELECT_VERSION, "transcript": fingerprint(words), "min_len": min_len,
                   "max_len": max_len, "model": model, "chunks": [list(c) for c in self.chunks],
                   "focus": self.focus}
+        if not earlier:
+            params["earlier"] = False  # only when off, so searches made before this option existed still count
         previous = read_json(self.path) if self.path.exists() else None
         old = previous if not force else None
         if old and {k: old["params"].get(k) for k in ("version", "transcript")} != \
@@ -559,7 +649,7 @@ class Selector:
             earlier = (old.get("earlier", []) + old["candidates"]) if old else []
             state = {"params": params, "done": [], "candidates": [], "rescored": {},
                      "search": old.get("search", 1) + 1 if old else 1, "earlier": earlier,
-                     "avoid": [list(x) for x in sorted({(c["start"], c["end"]) for c in earlier}
+                     "avoid": [list(x) for x in sorted({span for c in earlier for span in clip_spans(c)}
                                                        | {tuple(x) for x in also_avoid})] if new_search else []}
         for key, default in (("search", 1), ("earlier", []), ("avoid", [])):
             state.setdefault(key, default)
@@ -585,20 +675,41 @@ class Selector:
         a, b = self.chunks[k]
         return self.sentences[a].start, self.sentences[b].end
 
+    def _earlier_parts(self, proposal: dict, si: int) -> tuple[list[tuple[int, int]], int]:
+        """The proposal's earlier parts as (first, last) sentences, and the clip's first sentence. Parts that
+        reach into the clip or into each other are dropped; one that runs straight into the clip just makes
+        it start earlier. Parts are dropped from the front while they leave the clip too little time."""
+        parts: list[tuple[int, int]] = []
+        for b in (proposal.get("before") or [])[:MAX_EARLIER_PARTS] if self.earlier else []:
+            a, z = snap(self.tl, b["start"], b["end"])
+            if z < si and not any(a <= y and z >= x for x, y in parts):
+                parts.append((a, z))
+        if parts and parts[-1][1] == si - 1:
+            si = parts.pop()[0]
+        while parts and sum(self.tl.dur(a, z) for a, z in parts) > self.max_len - MIN_MAIN_PART:
+            parts.pop(0)
+        return parts, si
+
     def _add(self, proposal: dict, call: str) -> None:
         si, ei = snap(self.tl, proposal["start"], proposal["end"])
-        if ei > si and self.tl.dur(si, ei) > self.max_len:
-            self._pending.append((proposal, call, si, ei))  # Claude decides what to cut, see _trim
+        before, si = self._earlier_parts(proposal, si)
+        extra = sum(self.tl.dur(a, z) for a, z in before)
+        if ei > si and self.tl.dur(si, ei) > self.max_len - extra:
+            self._pending.append((proposal, call, si, ei, before))  # Claude decides what to cut, see _trim
         else:
-            self._commit(proposal, call, si, ei)
+            self._commit(proposal, call, si, ei, before)
 
-    def _commit(self, proposal: dict, call: str, si: int, ei: int, trimmed: bool = False) -> None:
-        fitted = fit(self.tl, si, ei, self.min_len, self.max_len)
+    def _commit(self, proposal: dict, call: str, si: int, ei: int, before: list[tuple[int, int]] = (),
+                trimmed: bool = False) -> None:
+        before = list(before)
+        extra = sum(self.tl.dur(a, z) for a, z in before)
+        lo, hi = main_limits(self.min_len, self.max_len, extra)
+        fitted = fit(self.tl, si, ei, lo, hi, floor=max(z for _, z in before) + 1 if before else None)
         if fitted is None:
             log(f"select: dropped \"{proposal['title']}\": can't fit {self.min_len:.0f}-{self.max_len:.0f}s")
             return
         si, ei = fitted
-        text = self.tl.text(si, ei)
+        text = parts_text(self.tl, before, si, ei)
         cands = self.state["candidates"]
         n = len(self.state["earlier"]) + len(cands) + 1
         while f"c{n}" in self._taken:
@@ -622,7 +733,10 @@ class Selector:
             "start": round(self.tl.clip_start(si), 3),
             "end": round(self.tl.clip_end(ei), 3),
             "text": text,
+            **({"before": [part_record(self.tl, a, z) for a, z in before]} if before else {}),
         })
+        if before:
+            log(f"select: \"{proposal['title']}\" plays {len(before)} earlier part(s) first")
 
     def _trim(self) -> None:
         """Ask Claude which sentences to keep for proposals that ran over the maximum length."""
@@ -631,8 +745,10 @@ class Selector:
         jobs = {f"t{n}": item for n, item in enumerate(self._pending, 1)}
         self._pending = []
         log(f"select: asking Claude where to shorten {len(jobs)} clip(s) longer than {self.max_len:.0f}s")
-        spans = {tid: (si, ei) for tid, (_, _, si, ei) in jobs.items()}
-        prompt = _trim_prompt(self.title, self.tl, {tid: (si, ei, p["title"]) for tid, (p, _, si, ei) in jobs.items()},
+        extra = {tid: sum(self.tl.dur(a, z) for a, z in before) for tid, (*_, before) in jobs.items()}
+        spans = {tid: (si, ei, extra[tid]) for tid, (_, _, si, ei, _) in jobs.items()}
+        prompt = _trim_prompt(self.title, self.tl,
+                              {tid: (si, ei, p["title"], extra[tid]) for tid, (p, _, si, ei, _) in jobs.items()},
                               self.min_len, self.max_len)
         try:
             trims = self.claude.ask(SYSTEM_PROMPT, prompt,
@@ -643,12 +759,12 @@ class Selector:
         except ClipperError as e:
             log(f"select: {e}; trimming from the end instead")
             trims = {}
-        for tid, (proposal, call, si, ei) in jobs.items():
+        for tid, (proposal, call, si, ei, before) in jobs.items():
             if tid in trims:
                 first, last = trims[tid]
-                self._commit(proposal, call, si + first - 1, si + last - 1, trimmed=True)
+                self._commit(proposal, call, si + first - 1, si + last - 1, before, trimmed=True)
             else:
-                self._commit(proposal, call, si, ei)
+                self._commit(proposal, call, si, ei, before)
 
     def _round(self, key: str, count_for_chunk: Callable[[int], int], with_avoid: bool) -> None:
         jobs = []
@@ -659,7 +775,7 @@ class Selector:
             lo, hi = self._chunk_bounds(k)
             avoid = [(s, e) for s, e in self.state["avoid"]]
             if with_avoid:
-                avoid += [(c["start"], c["end"]) for c in self.state["candidates"]]
+                avoid += [span for c in self.state["candidates"] for span in clip_spans(c)]
             avoid = sorted((s, e) for s, e in avoid if s < hi and e > lo)
             if avoid and hi - lo - merged_length(avoid, lo, hi) < self.min_len:
                 self.state["done"].append(call)
@@ -675,7 +791,7 @@ class Selector:
             where = f"chunk {k + 1}/{len(self.chunks)}" if len(self.chunks) > 1 else "transcript"
             log(f"select: asking Claude for up to {count} clips ({where}, {fmt_time(lo)}-{fmt_time(hi)})")
             prompt = _proposal_prompt(self.title, self.tl, a, b, count, self.min_len, self.max_len, avoid,
-                                      self.cues, self.focus)
+                                      self.cues, self.focus, self.earlier)
             return claude.ask(SYSTEM_PROMPT, prompt, lambda r: parse_proposals(r, lo, hi),
                               what=f"proposals for {where}")
 
@@ -721,7 +837,8 @@ class Selector:
         cands = self.state["candidates"]
         if len({c["call"] for c in cands}) < 2 or len(cands) < 2:
             return
-        key = fingerprint([(c["id"], c["si"], c["ei"]) for c in cands])
+        key = fingerprint([(c["id"], c["si"], c["ei"], *[(p["si"], p["ei"]) for p in c.get("before", [])])
+                           for c in cands])
         scores = self.state["rescored"].get(key)
         if scores is None:
             log(f"select: asking Claude to rank all {len(cands)} candidates against each other")
@@ -776,18 +893,20 @@ def select_clips(work: Path, meta: dict, transcript: dict, *, num_clips: int, mi
                  max_len: float, model: str, claude_factory: Callable[[], Claude],
                  force: bool = False, focus: str | None = None,
                  time_range: tuple[float | None, float | None] = (None, None),
-                 new_search: bool = False, also_avoid: list[tuple[float, float]] = ()) -> list[dict]:
+                 new_search: bool = False, also_avoid: list[tuple[float, float]] = (),
+                 earlier: bool = True) -> list[dict]:
     if min_len <= 0 or max_len < min_len:
         raise ClipperError("--min-len must be positive and no larger than --max-len")
     sel = Selector(work, meta, transcript, min_len=min_len, max_len=max_len, model=model,
                    claude_factory=claude_factory, force=force, focus=focus, time_range=time_range,
-                   new_search=new_search, also_avoid=also_avoid)
+                   new_search=new_search, also_avoid=also_avoid, earlier=earlier)
     if new_search and sel.state["avoid"]:
         log(f"select: looking for new clips, away from the {len(sel.state['avoid'])} suggested or made before")
     clips = sel.run(num_clips)
     write_json(work / "clips.json", clips)
     for c in clips:
-        log(f"select: #{c['rank']} [{c['score']}] {fmt_time(c['start'])}-{fmt_time(c['end'])} "
+        spans = " + ".join(f"{fmt_time(s)}-{fmt_time(e)}" for s, e in clip_spans(c))
+        log(f"select: #{c['rank']} [{c['score']}] {spans} "
             f"({c['duration']:.0f}s) {c.get('type') or 'other'}: {c['title']}")
     return clips
 
@@ -802,7 +921,9 @@ def saved_candidates(work: Path) -> list[dict]:
 
 
 def clips_from_review(transcript: dict, meta: dict, candidates: list[dict], items: list[dict]) -> list[dict]:
-    """Clips chosen and adjusted by hand: items are {"id"?, "si", "ei", "title"?} in the wanted order."""
+    """Clips chosen and adjusted by hand: items are {"id"?, "si", "ei", "title"?, "before"?} in the wanted
+    order. before: the earlier parts played first, as [first, last] sentences; without it, a suggestion
+    keeps its own."""
     tl = timeline_for(transcript, meta)
     by_id = {c["id"]: c for c in candidates}
     n = len(tl.sentences)
@@ -811,5 +932,12 @@ def clips_from_review(transcript: dict, meta: dict, candidates: list[dict], item
         si, ei = int(item["si"]), int(item["ei"])
         if not 0 <= si <= ei < n:
             raise ClipperError(f"Clip {rank}: sentences {si}-{ei} are outside the transcript")
-        out.append(make_clip(tl, rank, si, ei, by_id.get(item.get("id")), item.get("title")))
+        before = None
+        if item.get("before") is not None:
+            before = [(int(a), int(b)) for a, b in item["before"]]
+            for k, (a, b) in enumerate(before):
+                if not 0 <= a <= b < si or any(a <= y and b >= x for x, y in before[:k]):
+                    raise ClipperError(f"Clip {rank}: earlier part {a}-{b} must come before the clip "
+                                       "and not overlap its other parts")
+        out.append(make_clip(tl, rank, si, ei, by_id.get(item.get("id")), item.get("title"), before))
     return out
