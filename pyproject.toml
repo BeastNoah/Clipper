@@ -25,7 +25,7 @@ mac = ["mlx-whisper; sys_platform == 'darwin' and platform_machine == 'arm64'"]
 clipper = "clipper.cli:main"
 
 [tool.setuptools]
-packages = ["clipper", "clipper.ui"]
+packages = ["clipper", "clipper.publish", "clipper.ui"]
 
 [tool.setuptools.package-data]
 "clipper.ui" = ["static/*"]
