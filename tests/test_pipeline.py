@@ -208,3 +208,47 @@ def test_failed_rerender_keeps_the_clips_already_made(tmp_path, fake_claude, mon
     assert cli.main(args("--force", "render")) == 0
     assert not (out / ".next").exists()
     assert sorted(p.name for p in out.iterdir()) == sorted(before)
+
+
+def test_clip_with_an_earlier_part(tmp_path, fake_claude, monkeypatch):
+    from clipper.pipeline import caption_lines, clip_dir_for
+
+    monkeypatch.setenv("FAKE_CLAUDE_BEFORE", "1")  # the best clip plays the first sentence before it
+    src = tmp_path / "talk.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=40",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=40", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    root = tmp_path / "work"
+    args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "8", "--max-len", "12",
+            "--preset", "ultrafast", "--caption-model", "none", "--jump-cuts", "off", "--no-posts"]
+    assert cli.main([*args, "--stop-after", "ingest"]) == 0
+    (work,) = root.iterdir()
+    meta = json.loads((work / "meta.json").read_text())
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "en", "words": make_words(
+            [f"This is spoken sentence number {i} today." for i in range(14)], start=0.5)},
+    })
+    assert cli.main(args) == 0
+    (clip,) = json.loads((work / "output" / "clips.json").read_text())
+    (part,) = clip["before"]
+    assert part["si"] == 0 and part["end"] < clip["start"]
+    assert 8 <= clip["duration"] <= 12
+    out = work / "output" / clip["file"]
+    assert float(ffprobe(out)["format"]["duration"]) == pytest.approx(clip["duration"], abs=0.15)
+    # each part's section is fetched on its own (not the stretch in between); the render has its own folder
+    sections = sorted((work / "clips").glob("*/section.mp4"))
+    assert len(sections) == 2 and all(float(ffprobe(p)["format"]["duration"]) < 16 for p in sections)
+    cdir = clip_dir_for(work, clip)
+    assert "+" in cdir.name and (cdir / "9x16" / "clip.mp4").exists()
+    srt = (work / "output" / clip["srt"][0]).read_text()
+    assert "number 0 today" in srt and f"number {clip['si']} today" in srt
+    lines = caption_lines(work, clip)
+    assert lines[0]["text"] == "This is spoken sentence number 0 today."
+    assert lines[1]["start"] >= clip["start"]
+
+    # a second run reuses the render
+    mtime = out.stat().st_mtime_ns
+    assert cli.main(args) == 0
+    assert out.stat().st_mtime_ns == mtime

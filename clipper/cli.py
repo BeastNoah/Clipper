@@ -12,6 +12,7 @@ from .ingest import expand_sources
 from .pipeline import STEPS, Options, process
 from .reframe import LAYOUTS
 from .render import ENCODERS
+from .select import clip_spans
 from .util import ClipperError, fmt_time, log
 
 USAGE = """\
@@ -42,6 +43,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--new-clips", action="store_true",
                    help="ask for clips at moments Claude hasn't suggested before; they're made alongside the "
                         "clips already made (for a video that's been through clipper before)")
+    g.add_argument("--no-earlier-parts", action="store_true",
+                   help="don't let Claude put earlier parts of the video (a joke's set-up, the question being "
+                        "answered) in front of a clip")
     g.add_argument("--from", dest="range_start", default=None, metavar="TIME",
                    help="only use the video from this time on (seconds, 12:30 or 1:02:03)")
     g.add_argument("--to", dest="range_end", default=None, metavar="TIME", help="only use the video up to this time")
@@ -104,7 +108,7 @@ def options_from_args(args: argparse.Namespace) -> Options:
         language=args.language, caption_model=args.caption_model, caption_style=args.caption_style,
         font=args.font, caption_size=args.caption_size, highlight_color=args.highlight_color,
         uppercase=args.uppercase, caption_position=args.caption_position, title_overlay=not args.no_title,
-        jump_cuts=args.jump_cuts, layout=args.layout, encoder=args.encoder, crf=args.crf, preset=args.preset,
+        earlier_parts=not args.no_earlier_parts, jump_cuts=args.jump_cuts, layout=args.layout, encoder=args.encoder, crf=args.crf, preset=args.preset,
         posts=not args.no_posts, force=args.force, stop_after=args.stop_after,
     ).validate()
 
@@ -113,7 +117,7 @@ def _summary(work: Path, clips: list[dict]) -> None:
     out_dir = work / "output"
     for c in clips:
         line = f"{c['rank']:2d}. [{c['score'] if c.get('score') is not None else '-':>3}] " \
-               f"{fmt_time(c['start'])}-{fmt_time(c['end'])}  {c['title']}"
+               f"{' + '.join(f'{fmt_time(s)}-{fmt_time(e)}' for s, e in clip_spans(c))}  {c['title']}"
         if c.get("file"):
             line += f"\n    {out_dir / c['file']}"
         print(line)

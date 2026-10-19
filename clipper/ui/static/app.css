@@ -194,6 +194,8 @@ details[open] > summary::before { content: "▾ "; }
 .nudge .btn { padding: 2px 8px; border-radius: 7px; background: none; border: 0; }
 .nudge .btn:hover { background: var(--panel); }
 .cand-text { font-size: 13px; color: var(--muted); margin-top: 8px; }
+.earlier { margin-top: 8px; display: grid; gap: 4px; }
+.earlier-part { display: flex; gap: 8px; align-items: baseline; }
 
 .renderbar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 15;

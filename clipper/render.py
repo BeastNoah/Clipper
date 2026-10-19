@@ -62,6 +62,20 @@ def encoder_args(encoder: str, crf: int, preset: str) -> list[str]:
     return ["-c:v", "libx264", "-preset", preset, "-crf", str(crf)]
 
 
+@dataclass
+class Piece:
+    """One stretch of the video in a clip: start-end on the transcript's timeline, cut from `src`, with its
+    framing plan and jump cuts. Most clips are one piece; a clip with earlier parts plays several in a row."""
+    src: "ClipVideo"
+    start: float
+    end: float
+    plan: dict
+    edit: EditMap
+
+    def key(self) -> list:
+        return [self.start, self.end, fingerprint(self.plan), self.edit.segments, self.src.key()]
+
+
 # ---------------------------------------------------------------------------------------------
 # Extras drawn on the frames
 
@@ -205,64 +219,72 @@ def vertical_frame(frame: np.ndarray, v, cw: int, fmt: Format = VERTICAL, zoom: 
 # ---------------------------------------------------------------------------------------------
 # Encoding
 
-def _audio_filter(edit: EditMap) -> list[str]:
-    """Join the kept parts of the audio, with 10 ms fades so the cuts don't click."""
+def _audio_filter(pieces: list[Piece]) -> list[str]:
+    """Join the kept parts of the audio (input n + 1 is piece n), with 10 ms fades so the cuts don't click."""
     parts, labels = [], []
-    for i, (a, b) in enumerate(edit.segments):
-        fade_out = max(0.0, b - a - 0.01)
-        parts.append(f"[1:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS,"
-                     f"afade=t=in:d=0.01,afade=t=out:st={fade_out:.4f}:d=0.01[a{i}]")
-        labels.append(f"[a{i}]")
+    for n, piece in enumerate(pieces):
+        for i, (a, b) in enumerate(piece.edit.segments):
+            fade_out = max(0.0, b - a - 0.01)
+            parts.append(f"[{n + 1}:a]atrim=start={a:.4f}:end={b:.4f},asetpts=PTS-STARTPTS,"
+                         f"afade=t=in:d=0.01,afade=t=out:st={fade_out:.4f}:d=0.01[a{n}_{i}]")
+            labels.append(f"[a{n}_{i}]")
     parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[aout]")
     return ["-filter_complex", ";".join(parts), "-map", "[aout]"]
 
 
-def _encode(video: Path, offset: float, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: Path, out: Path,
-            enc_args: list[str], cover_frame: Path, fmt: Format, look: Look) -> None:
+def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, enc_args: list[str],
+            cover_frame: Path, fmt: Format, look: Look) -> None:
     fps = Fraction(meta["fps"])
-    start, dur = clip["start"] - offset, clip["end"] - clip["start"]  # in the video file's own time
-    W, H, cw = plan["width"], plan["height"], plan["crop_w"]
-    xs = plan["x"]
-    audio = ["-map", "1:a:0"] if edit.is_identity else _audio_filter(edit)
+    duration = sum(p.edit.duration for p in pieces)
+    inputs = []
+    for p in pieces:  # each piece's stretch, in its video file's own time
+        inputs += ["-ss", f"{p.start - p.src.offset:.3f}", "-t", f"{p.end - p.start:.3f}", "-i", str(p.src.path.resolve())]
+    single = len(pieces) == 1 and pieces[0].edit.is_identity
+    audio = ["-map", "1:a:0"] if single else _audio_filter(pieces)
     cmd = [
         "ffmpeg", "-y", "-v", "error", "-nostdin",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{fmt.width}x{fmt.height}", "-framerate", str(fps),
-        "-i", "pipe:0",
-        "-ss", f"{start:.3f}", "-t", f"{dur:.3f}", "-i", str(video.resolve()),
+        "-i", "pipe:0", *inputs,
         "-map", "0:v:0", *audio,
         "-vf", f"ass={ass.name}",
         *enc_args, "-pix_fmt", "yuv420p",
         "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709",
-        "-c:a", "aac", "-b:a", "192k", "-t", f"{edit.duration:.3f}",
+        "-c:a", "aac", "-b:a", "192k", "-t", f"{duration:.3f}",
         "-movflags", "+faststart", str(out.resolve()),
     ]
-    keep = edit.frame_ranges(float(fps))
-    total = sum(b - a for a, b in keep)
+    total = sum(b - a for p in pieces for a, b in p.edit.frame_ranges(float(fps)))
     cover_index = min(total - 1, round(COVER_AT * float(fps)))
     overlay = Overlay(look, fmt)
     progress = Progress(f"render #{clip['rank']} ({fmt.name})", total)
     with tempfile.TemporaryFile() as err:
         # Run from the clip folder so the subtitle path needs no filter-graph escaping.
         enc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=err, cwd=ass.parent)
-        frames = read_frames(video, start, dur, W, H)
-        written, r = 0, 0
+        written = 0
         try:
-            for i, frame in enumerate(frames):
-                while r < len(keep) and i >= keep[r][1]:
-                    r += 1
-                if r >= len(keep):
-                    break
-                if i < keep[r][0]:
-                    continue  # cut out by a jump cut
-                zoom = zoom_at(written / float(fps), look.zoom) if look.zoom else 1.0
-                img = vertical_frame(frame, xs[min(i, len(xs) - 1)] if xs else None, cw, fmt, zoom)
-                if written == cover_index:
-                    import cv2
-                    cv2.imwrite(str(cover_frame), img)  # before the logo and bar: the cover stays clean
-                img = overlay.apply(img, (written + 1) / max(total, 1))
-                enc.stdin.write(np.ascontiguousarray(img).data)
-                written += 1
-                progress.update(written)
+            for p in pieces:
+                keep, xs, cw = p.edit.frame_ranges(float(fps)), p.plan["x"], p.plan["crop_w"]
+                frames = read_frames(p.src.path, p.start - p.src.offset, p.end - p.start,
+                                     p.plan["width"], p.plan["height"])
+                r = 0
+                try:
+                    for i, frame in enumerate(frames):
+                        while r < len(keep) and i >= keep[r][1]:
+                            r += 1
+                        if r >= len(keep):
+                            break
+                        if i < keep[r][0]:
+                            continue  # cut out by a jump cut
+                        zoom = zoom_at(written / float(fps), look.zoom) if look.zoom else 1.0
+                        img = vertical_frame(frame, xs[min(i, len(xs) - 1)] if xs else None, cw, fmt, zoom)
+                        if written == cover_index:
+                            import cv2
+                            cv2.imwrite(str(cover_frame), img)  # before the logo and bar: the cover stays clean
+                        img = overlay.apply(img, (written + 1) / max(total, 1))
+                        enc.stdin.write(np.ascontiguousarray(img).data)
+                        written += 1
+                        progress.update(written)
+                finally:
+                    frames.close()
             enc.stdin.close()
         except BrokenPipeError:
             pass  # the encoder stopped early; its exit code and stderr say why
@@ -271,7 +293,6 @@ def _encode(video: Path, offset: float, meta: dict, clip: dict, plan: dict, edit
             enc.wait()
             raise
         finally:
-            frames.close()
             Progress.clear_line()
         if enc.wait() != 0:
             err.seek(0)
@@ -288,32 +309,37 @@ def make_cover(out_dir: Path) -> Path:
     return out
 
 
-def render(work: Path, meta: dict, clip: dict, plan: dict, edit: EditMap, ass: Path, out_dir: Path, *,
+def render(work: Path, meta: dict, clip: dict, pieces: list[Piece], ass: Path, out_dir: Path, *,
            fmt: Format = VERTICAL, look: Look | None = None, encoder: str = "x264", crf: int = 20,
-           preset: str = "medium", force: bool = False, src: "ClipVideo | None" = None) -> Path:
-    from .ingest import ClipVideo
-
-    src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
+           preset: str = "medium", force: bool = False) -> Path:
+    """Render the clip's pieces, one after the other, into out_dir/clip.mp4 (and its cover)."""
     look = look or Look()
     out = out_dir / "clip.mp4"
     stamp = out_dir / "render.json"
     encoder = resolve_encoder(encoder)
     enc_args = encoder_args(encoder, crf, preset)
     params = {
-        "version": RENDER_VERSION, "start": clip["start"], "end": clip["end"], "plan": fingerprint(plan),
-        "edit": edit.segments, "captions": hashlib.sha1(ass.read_bytes()).hexdigest()[:12],
+        "version": RENDER_VERSION, "captions": hashlib.sha1(ass.read_bytes()).hexdigest()[:12],
         "cover": hashlib.sha1((out_dir / "cover.ass").read_bytes()).hexdigest()[:12], "encoder": enc_args,
-        "video": src.key(), "format": fmt.name, "look": look.key(),
+        "format": fmt.name, "look": look.key(),
     }
+    if len(pieces) == 1:  # the same stamp as before clips could have earlier parts, so those renders still count
+        p = pieces[0]
+        params.update({"start": p.start, "end": p.end, "plan": fingerprint(p.plan), "edit": p.edit.segments,
+                       "video": p.src.key()})
+    else:
+        params["pieces"] = [p.key() for p in pieces]
     params = json.loads(json.dumps(params))  # tuples -> lists, to compare with the stored JSON
     if not force and out.exists() and stamp.exists() and read_json(stamp) == params:
         log(f"render #{clip['rank']} ({fmt.name}): reusing {out.parent.parent.name}/{out.parent.name}/{out.name}")
         return out
-    cut = clip["end"] - clip["start"] - edit.duration
-    log(f"render #{clip['rank']}: encoding {edit.duration:.0f}s at {fmt.width}x{fmt.height} ({encoder})"
+    duration = sum(p.edit.duration for p in pieces)
+    cut = sum(p.end - p.start for p in pieces) - duration
+    log(f"render #{clip['rank']}: encoding {duration:.0f}s at {fmt.width}x{fmt.height} ({encoder})"
+        + (f" from {len(pieces)} parts of the video" if len(pieces) > 1 else "")
         + (f", {cut:.1f}s of pauses cut" if cut > 0.05 else ""))
     tmp = out_dir / "clip.tmp.mp4"
-    _encode(src.path, src.offset, meta, clip, plan, edit, ass, tmp, enc_args, out_dir / "cover_frame.png", fmt, look)
+    _encode(meta, clip, pieces, ass, tmp, enc_args, out_dir / "cover_frame.png", fmt, look)
     os.replace(tmp, out)
     make_cover(out_dir)
     write_json(stamp, params)

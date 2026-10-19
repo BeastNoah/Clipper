@@ -5,7 +5,7 @@ import pytest
 
 from clipper.llm import Claude, InvalidReply
 from clipper.select import (
-    CHUNK_SECONDS, Timeline, clips_from_review, combine, make_chunks, moment_type, parse_proposals,
+    CHUNK_SECONDS, Selector, Timeline, clips_from_review, combine, make_chunks, moment_type, parse_proposals,
     parse_rescores, merged_length, resolve_overlaps, saved_candidates, select_clips, snap, snap_and_fit,
     split_sentences,
 )
@@ -376,3 +376,74 @@ def test_answers_for_other_parts_are_kept_when_one_part_fails(tmp_path, fake_cla
     select_clips(tmp_path, meta, {"words": words}, num_clips=4, **kw)
     asked = [c for c in _calls(fake_claude)[n:] if "<transcript>" in c["prompt"] and "already taken" not in c["prompt"]]
     assert len(asked) == 2  # only the parts that failed are asked about again
+
+
+def test_parse_proposals_checks_earlier_parts():
+    clip = {"start": 50, "end": 80, "title": "T", "hook": "H",
+            "scores": {"hook": 8, "payoff": 7, "reaction": 5, "pace": 6}, "before": [{"start": 10, "end": 15}]}
+    (got,) = parse_proposals(json.dumps({"clips": [clip]}), 0, 100)
+    assert got["before"] == [{"start": 10, "end": 15}]
+    clip["before"] = [{"start": 60, "end": 70}]
+    with pytest.raises(InvalidReply, match="must end before the clip starts"):
+        parse_proposals(json.dumps({"clips": [clip]}), 0, 100)
+    clip["before"] = [{"start": 10, "end": 15}] * 4
+    with pytest.raises(InvalidReply, match="at most 3"):
+        parse_proposals(json.dumps({"clips": [clip]}), 0, 100)
+
+
+def test_earlier_parts_are_snapped_merged_and_kept_short(tmp_path):
+    words = make_words([f"This is sentence {i} of the test." for i in range(40)])  # ~3s per sentence
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    sel = Selector(tmp_path, meta, {"words": words}, min_len=10, max_len=20, model="test", claude_factory=None)
+    s = sel.tl.sentences
+    part = lambda a, b: {"start": s[a].start + 0.3, "end": s[b].end - 0.2}  # noqa: E731
+    # snapped to whole sentences; parts that reach into the clip or into each other are dropped
+    assert sel._earlier_parts({"before": [part(2, 3), part(3, 4), part(18, 21)]}, 20) == ([(2, 3)], 20)
+    # a part that runs straight into the clip just makes it start earlier
+    assert sel._earlier_parts({"before": [part(2, 2), part(18, 19)]}, 20) == ([(2, 2)], 18)
+    # parts are dropped from the front while they leave the clip too little time
+    assert sel._earlier_parts({"before": [part(1, 3), part(6, 9)]}, 20) == ([(6, 9)], 20)
+    sel.earlier = False
+    assert sel._earlier_parts({"before": [part(2, 3)]}, 20) == ([], 20)
+
+
+def test_clips_can_play_earlier_parts_first(tmp_path, fake_claude, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_BEFORE", "1")
+    words = make_words([f"Here is a thought number {i} worth sharing." for i in range(60)])
+    meta = {"duration": words[-1]["e"] + 1, "title": "Test"}
+    kw = dict(min_len=20, max_len=40, model="test", claude_factory=lambda: Claude("test"))
+    clips = select_clips(tmp_path, meta, {"words": words}, num_clips=3, **kw)
+    (clip,) = [c for c in clips if c.get("before")]
+    (part,) = clip["before"]
+    assert part["si"] == 0 and part["end"] < clip["start"]
+    assert clip["duration"] == pytest.approx(part["end"] - part["start"] + clip["end"] - clip["start"], abs=0.01)
+    assert 20 <= clip["duration"] <= 40
+    assert clip["text"].startswith("Here is a thought number 0 worth sharing. … ")
+    prompts = [c["prompt"] for c in _calls(fake_claude)]
+    assert any("Earlier parts:" in p for p in prompts if "<transcript>" in p)
+    # other clips never overlap any of its parts
+    for c in clips:
+        assert c is clip or all(c["end"] <= x or c["start"] >= y for x, y in [(part["start"], part["end"]),
+                                                                             (clip["start"], clip["end"])])
+
+    # switched off, Claude isn't told about earlier parts (and that's a search of its own)
+    n = len(_calls(fake_claude))
+    clips = select_clips(tmp_path, meta, {"words": words}, num_clips=3, earlier=False, **kw)
+    assert not any(c.get("before") for c in clips)
+    assert all("Earlier parts:" not in c["prompt"] for c in _calls(fake_claude)[n:])
+
+
+def test_review_items_keep_or_change_earlier_parts():
+    words = make_words([f"This is sentence {i} of the test." for i in range(30)])
+    meta = {"duration": words[-1]["e"] + 1}
+    tl = Timeline(split_sentences(words), words, meta["duration"])
+    cand = {"id": "c1", "si": 10, "ei": 13, "title": "T", "before": [{"si": 2, "ei": 3}]}
+    kept, changed, none = clips_from_review({"words": words}, meta, [cand], [
+        {"id": "c1", "si": 10, "ei": 13}, {"id": "c1", "si": 10, "ei": 13, "before": [[5, 5], [1, 1]]},
+        {"id": "c1", "si": 10, "ei": 13, "before": []}])
+    assert [(p["si"], p["ei"]) for p in kept["before"]] == [(2, 3)]
+    assert [(p["si"], p["ei"]) for p in changed["before"]] == [(5, 5), (1, 1)]  # played in the order given
+    assert "before" not in none and none["duration"] == pytest.approx(tl.dur(10, 13), abs=0.01)
+    assert kept["duration"] == pytest.approx(tl.dur(10, 13) + tl.dur(2, 3), abs=0.01)
+    with pytest.raises(ClipperError, match="must come before the clip"):
+        clips_from_review({"words": words}, meta, [cand], [{"id": "c1", "si": 10, "ei": 13, "before": [[9, 11]]}])

@@ -65,7 +65,9 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   a better clip. You can preview it in
   the player (for YouTube links that's YouTube's own player, since only the sound has been
   downloaded at that point), tick the ones you want, rename them, and move the start or end by a sentence.
-  Click two sentences in the transcript to add a clip of your own.
+  Click two sentences in the transcript to add a clip of your own. A clip that plays earlier parts of the
+  video first (see below) lists them under "Played first"; preview or remove each one, or preview a clip,
+  mark a stretch before it in the transcript and press **Play before** to add one yourself.
 - **Find new clips:** on a video's page, ask Claude for more clips at any time, without downloading
   or transcribing again. Optionally say what to look for, how many and how long, and which part of
   the video. Claude only looks at moments it hasn't suggested yet; earlier suggestions and finished
@@ -114,6 +116,7 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--model` | `opus` | Claude model that picks the clips (`opus`, `sonnet`, `haiku` or a full name) |
 | `--prompt TEXT` | | what Claude should look for, e.g. `"funny moments"` or `"everything about pricing"` |
 | `--from` / `--to` | | only use part of the video, e.g. `--from 10:00 --to 45:00` |
+| `--no-earlier-parts` | | don't let Claude put earlier parts of the video (a joke's set-up, the question being answered) in front of a clip |
 | `--new-clips` | | for a video clipper has seen before: ask for clips at moments Claude hasn't suggested yet, and make them alongside the clips already made |
 | `--whisper-model` | `small` | model for the full transcript |
 | `--caption-model` | `turbo` | bigger model that re-transcribes only the chosen clips, for accurate captions; `none` reuses the transcript |
@@ -182,6 +185,15 @@ model runs at about 7–10x real time there, so a 20-minute video takes 2–3 mi
   candidates together, ranks them against each other (with some variety in the kinds of moment at
   the top), scores them again on one common scale and marks any that repeat the point of a better
   one. That ranking decides the final order.
+- Some moments only land because of something said earlier: the set-up of a joke or a callback, the
+  question being answered, the name the punchline depends on. Claude can then add up to three short
+  **earlier parts** to a clip. They are played first, in Claude's order, and the clip follows straight
+  after, without the minutes in between. The same works for a montage of short moments on one theme.
+  Earlier parts count towards the clip's length and are aligned to whole sentences like the rest; one
+  that runs straight into the clip just makes it start earlier. Each part's video is fetched on its own,
+  framed on its own, and the parts are rendered into one clip with one set of captions. Claude only uses
+  earlier parts from the same 15-minute chunk it is looking at. `--no-earlier-parts` (or the checkbox in
+  the web interface) turns this off.
 - clipper moves each start and end to the nearest sentence boundary so no word is cut off. If a
   clip then runs too long, Claude chooses which sentences to keep (so the punchline survives);
   if it's too short, code adds the next sentence. Where clips overlap or repeat each other, the
@@ -239,6 +251,8 @@ work/<video_id>/
   clips/<start>-<end>/ per clip: section.mp4 (just this part of the video), words.json,
                        words_edited.json (your caption fixes), and per format (9x16/, 1x1/, …):
                        reframe.json, captions.ass, clip.mp4, cover.jpg
+  clips/<start>-<end>+<id>/  a clip with earlier parts: its captions, caption fixes and render
+                       (each part's section, words and framing are in the part's own folder)
   output/              the finished clips, covers, caption files, post text and clips.json
 ```
 
