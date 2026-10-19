@@ -242,3 +242,23 @@ details[open] > summary::before { content: "▾ "; }
   .player-panel { position: static; }
   .video-head .muted.small { overflow-wrap: anywhere; }
 }
+
+/* Publishing */
+.account { border-top: 1px solid var(--line); padding: 12px 0; }
+.account-keys, .publish-form form { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; margin-top: 10px; text-align: left; }
+.dialog form.account-keys { text-align: left; }  /* the dialog right-aligns its own Close form */
+.account-keys label, .field { display: grid; grid-template-columns: minmax(0, 1fr); gap: 4px; font-size: 13px; font-weight: 550; }
+.account-keys input, .field input, .field textarea, .field select {
+  font: inherit; font-weight: 400; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; width: 100%; box-sizing: border-box; }
+.check { display: flex; align-items: flex-start; gap: 8px; font-size: 14px; min-width: 0; }
+.check input { margin-top: 3px; flex: none; }
+.publish-form { min-width: 0; overflow-wrap: break-word; }
+.publish-form .field span, .publish-form .check { white-space: normal; }
+.check input:disabled + * , .check:has(input:disabled) { color: var(--muted); }
+.checks { display: grid; gap: 6px; }
+.indent { display: grid; gap: 6px; padding-left: 26px; }
+.publish { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.posted-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.posted { font-size: 12px; font-weight: 600; color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent);
+  border-radius: 999px; padding: 3px 9px; text-decoration: none; }

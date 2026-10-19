@@ -114,8 +114,12 @@ async function pollJobs() {
       renderVideoJob();
       if (finished.some(j => j.video === S.route.id)) {
         const job = finished.find(j => j.video === S.route.id);
-        if (job.state === "done") toast(job.kind === "render" ? "Clips are ready" : job.kind === "suggest" ? "New suggestions are ready" : "Clips are ready to review");
-        await loadVideo(S.route.id, job.kind === "render" ? "clips" : "review");
+        if (job.kind === "publish") {
+          toast(job.state === "done" ? job.label.replace(/^Post to/, "Posted to") : job.state === "failed" ? `Posting failed: ${job.error}` : "Posting cancelled");
+        } else if (job.state === "done") {
+          toast(job.kind === "render" ? "Clips are ready" : job.kind === "suggest" ? "New suggestions are ready" : "Clips are ready to review");
+        }
+        await loadVideo(S.route.id, job.kind === "render" || job.kind === "publish" ? "clips" : "review");
       }
     }
     for (const job of finished) {
@@ -697,6 +701,8 @@ function clipCard(v, c) {
   if (platforms.length) setTimeout(() => show(0), 0);
 
   const editor = h("div", { class: "caption-editor", hidden: true });
+  const publishBox = h("div", { class: "publish", hidden: true });
+  const posted = Object.entries((v.published || {})[c.file] || {}).filter(([, r]) => r.status !== "failed");
   const card = h("div", { class: "panel clip-card" },
     player,
     formats.length > 1 ? h("div", { style: "margin-top:8px" }, pills) : null,
@@ -706,7 +712,12 @@ function clipCard(v, c) {
     h("div", { class: "row", style: "gap:8px" }, download, coverLink,
       ...(c.srt || []).map(f => h("a", { class: "btn ghost", href: media(f), download: f, title: "Caption file" },
         f.split(".").length > 2 ? `Captions (${f.split(".").slice(-2, -1)[0]})` : "Captions")),
-      h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor) }, "Fix captions")),
+      h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor) }, "Fix captions"),
+      h("button", { class: "btn", onclick: () => openPublish(v, c, publishBox) }, "Publish")),
+    posted.length ? h("div", { class: "posted-list" }, posted.map(([name, r]) =>
+      r.url ? h("a", { class: "posted", href: r.url, target: "_blank", rel: "noopener" }, `Posted to ${PLATFORM_NAMES[name]}`)
+            : h("span", { class: "posted" }, `Posted to ${PLATFORM_NAMES[name]}`))) : null,
+    publishBox,
     editor,
     platforms.length ? h("div", { class: "post" }, tabs, text,
       h("button", { class: "btn ghost small", style: "margin-top:6px", onclick: async () => {
@@ -738,6 +749,185 @@ async function openCaptionEditor(v, c, box) {
       h("button", { class: "btn primary", onclick: () => send({ lines: data.lines.map((l, i) => ({ ...l, text: inputs[i].value })) }) }, "Save and update"),
       data.edited ? h("button", { class: "btn ghost", onclick: () => send({ reset: true }) }, "Undo my corrections") : null,
       h("button", { class: "btn ghost", onclick: () => { box.hidden = true; } }, "Cancel")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Publishing
+
+const PLATFORM_NAMES = { youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram" };
+const KEY_LABELS = { client_id: "Client ID", client_secret: "Client secret", client_key: "Client key",
+  app_id: "App ID", app_secret: "App secret", config_id: "Configuration ID (optional)" };
+const TIKTOK_PRIVACY = { PUBLIC_TO_EVERYONE: "Everyone", MUTUAL_FOLLOW_FRIENDS: "Friends",
+  FOLLOWER_OF_CREATOR: "Followers", SELF_ONLY: "Only me" };
+const GUIDE_URL = "https://github.com/BeastNoah/Clipper/blob/claude/clipper-pipeline/docs/publishing.md";
+
+async function showAccounts() {
+  const dialog = $("#accounts-dialog"), body = $("#accounts-body");
+  if (!dialog.open) dialog.showModal();
+  let list;
+  try { list = await api.get("/api/accounts"); }
+  catch (e) { body.replaceChildren(h("div", { class: "error" }, e.message)); return; }
+  body.replaceChildren(
+    h("p", { class: "small muted" }, "Clips are posted with each platform's official API, through a free developer app you create once. ",
+      h("a", { href: GUIDE_URL, target: "_blank", rel: "noopener" }, "How to set them up")),
+    ...list.map(accountRow));
+}
+
+function accountRow(p) {
+  const fields = p.name === "instagram" ? [...p.app_fields, "config_id"] : p.app_fields;
+  const keys = h("form", { class: "account-keys", hidden: p.configured, onsubmit: async e => {
+    e.preventDefault();
+    try { await api.post(`/api/accounts/${p.name}/app`, Object.fromEntries(new FormData(keys))); toast("Saved"); showAccounts(); }
+    catch (err) { toast(err.message); }
+  } },
+    ...fields.map(f => h("label", {}, KEY_LABELS[f] || f,
+      h("input", { name: f, type: f.endsWith("secret") ? "password" : "text", autocomplete: "off", spellcheck: "false", required: f !== "config_id" }))),
+    h("div", { class: "row", style: "gap:8px" },
+      h("button", { class: "btn primary small", type: "submit" }, "Save keys"),
+      h("a", { class: "btn ghost small", href: p.setup_url, target: "_blank", rel: "noopener" }, "Create the app")));
+  const state = p.connected ? `Connected as ${p.account}` : p.configured ? "Not connected" : "Not set up yet";
+  return h("div", { class: "account" },
+    h("div", { class: "row", style: "justify-content:space-between; gap:8px; flex-wrap:nowrap" },
+      h("div", {}, h("b", {}, p.label), h("div", { class: "small muted" }, state)),
+      h("div", { class: "row", style: "gap:6px" },
+        p.configured ? h("button", { class: "btn ghost small", onclick: () => { keys.hidden = !keys.hidden; } }, "Keys") : null,
+        p.configured && !p.connected ? h("button", { class: "btn primary small", onclick: () => connectAccount(p) }, "Connect") : null,
+        p.connected ? h("button", { class: "btn ghost small", onclick: () => disconnectAccount(p) }, "Disconnect") : null)),
+    keys);
+}
+
+async function connectAccount(p) {
+  try {
+    const { url } = await api.post(`/api/accounts/${p.name}/connect`, {});
+    window.open(url, "_blank", "noopener");
+    toast("Allow access in the new tab, then come back here");
+  } catch (e) { toast(e.message); }
+}
+
+async function disconnectAccount(p) {
+  if (!confirm(`Disconnect ${p.label} (${p.account})? You can connect it again any time.`)) return;
+  try { await api.post(`/api/accounts/${p.name}/disconnect`, {}); showAccounts(); } catch (e) { toast(e.message); }
+}
+
+async function openPublish(v, c, box, platform) {
+  if (!box.hidden && !platform) { box.hidden = true; return; }
+  box.hidden = false;
+  box.replaceChildren(h("div", { class: "small muted" }, "Loading…"));
+  let data;
+  try { data = await api.get(`/api/videos/${v.id}/publish/${c.rank}`); }
+  catch (e) { box.replaceChildren(h("div", { class: "error" }, e.message)); return; }
+  platform = platform || (data.accounts.find(a => a.connected) || data.accounts[0]).name;
+  const acct = data.accounts.find(a => a.name === platform);
+  const area = h("div", { class: "publish-form" });
+  box.replaceChildren(
+    h("div", { class: "post-tabs" }, data.accounts.map(a =>
+      h("button", { class: a.name === platform ? "active" : null, onclick: () => openPublish(v, c, box, a.name) }, a.label))),
+    area);
+  if (!acct.connected) {
+    area.append(h("p", { class: "small muted" }, acct.configured ? `Connect your ${acct.label} account first.` : `${acct.label} isn't set up yet.`),
+      h("button", { class: "btn small", onclick: showAccounts }, "Open Accounts"));
+    return;
+  }
+  const done = data.published[platform];
+  const build = again => publishForm(v, c, box, area, acct, data.defaults[platform] || {}, again);
+  if (done && done.status !== "failed") {
+    area.append(
+      h("p", { class: "small" }, `Already posted to ${acct.label}`, done.url ? [": ", h("a", { href: done.url, target: "_blank", rel: "noopener" }, done.url)] : ".",
+        done.note ? h("span", { class: "muted" }, ` ${done.note}`) : null),
+      h("button", { class: "btn ghost small", onclick: () => { area.replaceChildren(); build(true); } }, "Post it again"));
+    return;
+  }
+  build(false);
+}
+
+async function publishForm(v, c, box, area, acct, defaults, again) {
+  area.append(h("div", { class: "small muted" }, "Loading your account…"));
+  let opts;
+  try { opts = await api.get(`/api/accounts/${acct.name}/options`); }
+  catch (e) { area.replaceChildren(h("div", { class: "error" }, e.message), h("button", { class: "btn small", onclick: showAccounts }, "Open Accounts")); return; }
+  const duration = c.final_duration || c.duration;
+  const button = h("button", { class: "btn primary", type: "submit" }, `Post to ${acct.label}`);
+  const field = (label, input, hint) => h("label", { class: "field" }, h("span", {}, label), input, hint ? h("span", { class: "small muted" }, hint) : null);
+  const check = (label, attrs = {}) => { const box = h("input", { type: "checkbox", ...attrs }); return [box, h("label", { class: "check" }, box, label)]; };
+  let collect, valid = () => true;
+  const parts = [h("div", { class: "small muted" }, `Posting to ${opts.account || acct.account}`)];
+
+  if (acct.name === "youtube") {
+    const title = h("input", { maxlength: 100, value: defaults.title || c.title });
+    const desc = h("textarea", { rows: 4 }, defaults.description || "");
+    const privacy = h("select", {}, opts.privacy_options.map(p => h("option", { value: p }, p[0].toUpperCase() + p.slice(1))));
+    const [kids, kidsLabel] = check("Made for kids");
+    parts.push(field("Title", title), field("Description", desc), field("Who can see it", privacy), kidsLabel);
+    collect = () => ({ title: title.value, description: desc.value, privacy: privacy.value, made_for_kids: kids.checked });
+  } else if (acct.name === "instagram") {
+    const caption = h("textarea", { rows: 5 }, defaults.caption || "");
+    const [feed, feedLabel] = check("Also show it in the profile grid", { checked: true });
+    parts.push(field("Caption", caption), feedLabel);
+    collect = () => ({ caption: caption.value, share_to_feed: feed.checked });
+  } else {
+    // TikTok: follows TikTok's content-sharing guidelines (no defaults for privacy or interactions).
+    const title = h("textarea", { rows: 4, maxlength: 2200 }, defaults.title || "");
+    const privacy = h("select", {}, h("option", { value: "", disabled: true, selected: true }, "Choose…"),
+      opts.privacy_options.map(p => h("option", { value: p }, TIKTOK_PRIVACY[p] || p)));
+    const [comment, commentLabel] = check(opts.comment_disabled ? "Allow comments (off in your TikTok settings)" : "Allow comments", { disabled: opts.comment_disabled });
+    const [duet, duetLabel] = check(opts.duet_disabled ? "Allow Duet (off in your TikTok settings)" : "Allow Duet", { disabled: opts.duet_disabled });
+    const [stitch, stitchLabel] = check(opts.stitch_disabled ? "Allow Stitch (off in your TikTok settings)" : "Allow Stitch", { disabled: opts.stitch_disabled });
+    const [commercial, commercialLabel] = check("This post promotes a brand, product or service");
+    const [yours, yoursLabel] = check("Your brand: you're promoting yourself or your own business");
+    const [branded, brandedLabel] = check("Branded content: you're promoting another brand or a third party");
+    const label = h("div", { class: "small muted" });
+    const consent = h("div", { class: "small" });
+    const brandBox = h("div", { class: "indent", hidden: true }, yoursLabel, brandedLabel, label);
+    const tooLong = opts.max_duration && duration > opts.max_duration;
+    const update = () => {
+      brandBox.hidden = !commercial.checked;
+      const isBranded = commercial.checked && branded.checked;
+      const selfOnly = [...privacy.options].find(o => o.value === "SELF_ONLY");
+      if (selfOnly) {
+        selfOnly.disabled = isBranded;
+        selfOnly.title = isBranded ? "Branded content can't be private" : "";
+        if (isBranded && privacy.value === "SELF_ONLY") privacy.value = "";
+      }
+      label.textContent = !commercial.checked ? "" : isBranded ? "Your video will be labeled “Paid partnership”."
+        : yours.checked ? "Your video will be labeled “Promotional content”." : "Say whether you're promoting yourself, a third party, or both.";
+      const link = (text, href) => h("a", { href, target: "_blank", rel: "noopener" }, text);
+      consent.replaceChildren("By posting, you agree to TikTok's ",
+        ...(isBranded ? [link("Branded Content Policy", "https://www.tiktok.com/legal/page/global/bc-policy/en"), " and "] : []),
+        link("Music Usage Confirmation", "https://www.tiktok.com/legal/page/global/music-usage-confirmation/en"), ".");
+      button.disabled = !valid();
+      button.title = commercial.checked && !(yours.checked || branded.checked)
+        ? "Say whether the post promotes yourself, a third party, or both" : "";
+    };
+    valid = () => !tooLong && privacy.value && (!commercial.checked || yours.checked || branded.checked);
+    [privacy, commercial, yours, branded].forEach(el => el.addEventListener("change", update));
+    parts.push(
+      field("Caption", title),
+      field("Who can see it", privacy, opts.privacy_options.length === 1 && opts.privacy_options[0] === "SELF_ONLY"
+        ? "Until TikTok audits your app, posts are visible only to you, and your account must be set to private." : null),
+      h("div", { class: "checks" }, commentLabel, duetLabel, stitchLabel),
+      commercialLabel, brandBox,
+      tooLong ? h("div", { class: "error" }, `This clip is ${Math.round(duration)}s; your account can post up to ${opts.max_duration}s.`) : null,
+      consent,
+      h("div", { class: "small muted" }, "After you post, TikTok can take a few minutes to process it before it shows on your profile."));
+    collect = () => ({ title: title.value, privacy: privacy.value, allow_comment: comment.checked, allow_duet: duet.checked,
+      allow_stitch: stitch.checked, commercial: commercial.checked, your_brand: yours.checked,
+      branded_content: branded.checked, consent: true });
+    setTimeout(update, 0);
+  }
+
+  const form = h("form", { onsubmit: async e => {
+    e.preventDefault();
+    if (!valid()) return;
+    button.disabled = true;
+    try {
+      await api.post(`/api/videos/${v.id}/publish/${c.rank}`, { platform: acct.name, form: collect(), again });
+      box.hidden = true;
+      toast(`Posting to ${acct.label}… you can keep working`);
+      pollJobs();
+    } catch (err) { toast(err.message); button.disabled = false; }
+  } }, ...parts, h("div", { class: "row", style: "gap:8px; margin-top:8px" }, button,
+    h("button", { class: "btn ghost", type: "button", onclick: () => { box.hidden = true; } }, "Cancel")));
+  area.replaceChildren(form);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -781,6 +971,8 @@ async function showPhone() {
 
 (async function init() {
   $("#phone-btn").addEventListener("click", showPhone);
+  $("#accounts-btn").addEventListener("click", showAccounts);
+  window.addEventListener("focus", () => { if ($("#accounts-dialog").open) showAccounts(); });  // back from signing in
   S.choices = await api.get("/api/choices");
   window.addEventListener("hashchange", route);
   await route();

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import html
 import ipaddress
 import json
 import math
@@ -32,6 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from .. import publish as pub
 from ..captions import PRESETS
 from ..edit import MODES as JUMP_CUT_MODES
 from ..formats import SIZES
@@ -196,6 +198,7 @@ def video_detail(work: Path) -> dict:
         data["sentences"] = []
     posts = work / "posts.json"
     data["has_posts"] = posts.exists()
+    data["published"] = pub.published(work)
     return data
 
 
@@ -381,6 +384,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             return self._file(STATIC / "index.html")
+        if parts[0] == "oauth" and len(parts) == 3 and parts[2] == "callback":
+            return self._oauth_callback(parts[1], qs)
         if parts[0] == "static" and len(parts) == 2 and re.match(r"^[\w.-]+$", parts[1]):
             return self._file(STATIC / parts[1])
         if parts[0] == "media" and len(parts) >= 3:
@@ -419,6 +424,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"rank": clip["rank"], "title": clip["title"],
                                    "lines": caption_lines(work, clip),
                                    "edited": edited_words(work, clip) is not None})
+            if len(route) == 4 and route[2] == "publish":
+                clip = self.app.rendered_clip(work, route[3])
+                if clip is None or not clip.get("file"):
+                    return self._error(404, "no such clip")
+                return self._json({"accounts": pub.status(), "defaults": post_defaults(clip),
+                                   "published": pub.published(work).get(clip["file"], {})})
             if route[2:] == ["frame"]:
                 try:
                     t = float((qs.get("t") or ["0"])[0])
@@ -427,10 +438,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not math.isfinite(t):
                     return self._error(400, "t must be a time in seconds")
                 return self._file(frame_jpeg(work, max(0.0, t)), cache=True)
+        if route == ["accounts"]:
+            return self._json(pub.status())
+        if len(route) == 3 and route[0] == "accounts" and route[2] == "options":
+            try:  # fetched every time the publish form opens (TikTok requires current creator info)
+                return self._json(pub.options(route[1]))
+            except ClipperError as e:
+                return self._error(400, str(e))
         if route == ["jobs"]:
-            return self._json(self.app.jobs.list())
+            return self._json(self.app.list_jobs())
         if len(route) == 2 and route[0] == "jobs":
-            job = self.app.jobs.jobs.get(route[1])
+            job = self.app.find_job(route[1])
             return self._json(job.public(with_log=True)) if job else self._error(404, "no such job")
         return self._error(404, "not found")
 
@@ -466,13 +484,70 @@ class Handler(BaseHTTPRequestHandler):
             except (ClipperError, ValueError, KeyError, TypeError) as e:
                 return self._error(400, str(e))
             return self._json(job.public(), 201)
+        if len(parts) == 5 and parts[:2] == ["api", "videos"] and parts[3] == "publish":
+            work = self._work(parts[2])
+            clip = self.app.rendered_clip(work, parts[4]) if work else None
+            if clip is None or not clip.get("file"):
+                return self._error(404, "no such clip")
+            body = self._body()
+            try:
+                job = self.app.publish_job(work, clip, str(body.get("platform") or ""), body.get("form") or {},
+                                           bool(body.get("again")))
+            except (ClipperError, ValueError, TypeError) as e:
+                return self._error(400, str(e))
+            return self._json(job.public(), 201)
+        if len(parts) == 4 and parts[:2] == ["api", "accounts"]:
+            return self._account_action(parts[2], parts[3])
         if len(parts) == 4 and parts[:2] == ["api", "jobs"] and parts[3] == "cancel":
-            job = self.app.jobs.jobs.get(parts[2])
+            job = self.app.find_job(parts[2])
             if not job:
                 return self._error(404, "no such job")
-            self.app.jobs.cancel(job)
+            self.app.manager_of(job).cancel(job)
             return self._json(job.public())
         return self._error(404, "not found")
+
+    def _redirect_uri(self, platform: str) -> str:
+        return f"http://localhost:{self.server.server_address[1]}/oauth/{platform}/callback"
+
+    def _account_action(self, platform: str, action: str):
+        body = self._body()
+        try:
+            if action == "app":
+                pub.save_app(platform, body)
+                return self._json({"ok": True})
+            if action == "disconnect":
+                pub.disconnect(platform)
+                return self._json({"ok": True})
+            if action == "connect":
+                if not ipaddress.ip_address(self.client_address[0]).is_loopback:
+                    return self._error(400, "Connect accounts on the computer that runs clipper, not from a phone.")
+                return self._json({"url": pub.connect_url(platform, self._redirect_uri(platform), self.app.logins)})
+        except ClipperError as e:
+            return self._error(400, str(e))
+        return self._error(404, "not found")
+
+    def _oauth_callback(self, platform: str, qs: dict):
+        """Where the platform sends the browser back after you allow access."""
+        get = lambda k: (qs.get(k) or [""])[0]  # noqa: E731
+        home = f"http://127.0.0.1:{self.server.server_address[1]}/"
+        if get("error"):
+            ok, msg = False, get("error_description") or get("error")
+        else:
+            try:
+                name = pub.finish_connect(platform, get("state"), get("code"), self.app.logins)
+                ok, msg = True, f"Connected {pub.PLATFORMS[platform].label} as {name}."
+            except (ClipperError, KeyError) as e:
+                ok, msg = False, str(e)
+        page = (f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+                f"<title>clipper</title><body style='font:16px system-ui;padding:32px;max-width:520px'>"
+                f"<h2>{'Connected' if ok else 'Not connected'}</h2><p>{html.escape(msg)}</p>"
+                f"<p><a href='{home}'>Back to clipper</a></p>").encode()
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(page)
 
     def do_PUT(self):
         url = urlparse(self.path)
@@ -509,10 +584,29 @@ class Handler(BaseHTTPRequestHandler):
         return self._json({"path": str(dest)}, 201)
 
 
+def post_defaults(clip: dict) -> dict:
+    """Claude's post text for each platform, as the publish form's starting point."""
+    post = clip.get("post") or {}
+    tags = " ".join("#" + t.lstrip("#") for t in post.get("hashtags") or [])
+
+    def with_tags(text: str) -> str:
+        text = (text or "").strip()
+        return text if not tags or tags in text else f"{text}\n\n{tags}".strip()
+
+    return {
+        "youtube": {"title": (post.get("youtube_title") or clip["title"])[:100],
+                    "description": with_tags(post.get("youtube_description") or "")},
+        "tiktok": {"title": with_tags(post.get("tiktok") or clip["title"])},
+        "instagram": {"caption": with_tags(post.get("instagram") or clip["title"])},
+    }
+
+
 class App:
     def __init__(self, root: Path, key: str | None = None, phone_url: str | None = None):
         self.root = root
         self.jobs = JobManager()
+        self.uploads = JobManager()  # posting runs on its own queue, so it never waits behind a render
+        self.logins = pub.Logins()
         self.key, self.phone_url = key, phone_url
 
     def make_job(self, body: dict) -> Job:
@@ -571,6 +665,26 @@ class App:
             what = f"{opts.num_clips} new clip(s)" + (f" ({opts.prompt})" if opts.prompt else "")
             return self.jobs.submit(Job("render" if render else "suggest", f"{what}: {title}", run, video=vid))
         raise ValueError("kind must be 'process', 'render', 'rerender' or 'new_clips'")
+
+    def list_jobs(self) -> list[dict]:
+        return sorted(self.jobs.list() + self.uploads.list(), key=lambda j: -j["created"])[:30]
+
+    def find_job(self, job_id: str) -> Job | None:
+        return self.jobs.jobs.get(job_id) or self.uploads.jobs.get(job_id)
+
+    def manager_of(self, job: Job) -> JobManager:
+        return self.uploads if job.id in self.uploads.jobs else self.jobs
+
+    def publish_job(self, work: Path, clip: dict, platform: str, form: dict, again: bool) -> Job:
+        if platform not in pub.PLATFORMS:
+            raise ValueError("Choose a platform to post to")
+        if not isinstance(form, dict):
+            raise ValueError("form must be an object")
+        label = pub.PLATFORMS[platform].label
+
+        def run(job: Job) -> None:
+            pub.publish_clip(work, clip, platform, form, again=again)
+        return self.uploads.submit(Job("publish", f"Post to {label}: {clip['title']}", run, video=work.name))
 
     def rendered_clip(self, work: Path, rank: str) -> dict | None:
         path = work / "output" / "clips.json"

@@ -273,3 +273,62 @@ def test_cancelling_a_queued_job_is_immediate():
         time.sleep(0.02)
     time.sleep(0.1)
     assert first.state == "done" and second.state == "cancelled" and not ran
+
+
+def test_publishing_routes(server, tmp_path, monkeypatch):
+    import urllib.parse
+
+    import clipper.publish as pub
+
+    port, work, _ = server
+    vid = work.name
+    monkeypatch.setenv("CLIPPER_CONFIG", str(tmp_path / "cfg"))
+    status, accts, _ = call(port, "GET", "/api/accounts")
+    assert status == 200 and [a["name"] for a in accts] == ["youtube", "tiktok", "instagram"]
+    assert not any(a["configured"] or a["connected"] for a in accts)
+
+    status, body, _ = call(port, "POST", "/api/accounts/youtube/connect", {})
+    assert status == 400 and "isn't set up" in body["error"]
+    assert call(port, "POST", "/api/accounts/youtube/app", {"client_id": "cid", "client_secret": "sec"})[0] == 200
+    status, body, _ = call(port, "POST", "/api/accounts/youtube/connect", {})
+    q = dict(urllib.parse.parse_qsl(urllib.parse.urlparse(body["url"]).query))
+    assert status == 200 and q["redirect_uri"] == f"http://localhost:{port}/oauth/youtube/callback"
+    assert q["client_id"] == "cid" and q["state"]
+    # a callback that this server didn't start, or that the user declined, connects nothing
+    status, page, _ = call(port, "GET", "/oauth/youtube/callback?state=forged&code=x")
+    assert status == 400 and b"unknown or too old" in page
+    status, page, _ = call(port, "GET", "/oauth/youtube/callback?error=access_denied&error_description=%3Cb%3Eno%3C/b%3E")
+    assert status == 400 and b"&lt;b&gt;no&lt;/b&gt;" in page  # escaped
+    assert call(port, "POST", "/api/accounts/nope/app", {})[0] == 400
+
+    out = work / "output"
+    out.mkdir(exist_ok=True)
+    (out / "01_hook.mp4").write_bytes(b"v" * 1000)
+    clip = {"rank": 1, "id": "c1", "title": "The hook", "file": "01_hook.mp4", "start": 1.0, "end": 9.0,
+            "post": {"tiktok": "Watch this", "instagram": "New reel", "youtube_title": "The hook, explained",
+                     "youtube_description": "More soon.", "hashtags": ["clips", "talk"]}}
+    write_json(out / "clips.json", [clip])
+    status, data, _ = call(port, "GET", f"/api/videos/{vid}/publish/1")
+    assert status == 200 and data["published"] == {}
+    assert data["defaults"]["youtube"] == {"title": "The hook, explained", "description": "More soon.\n\n#clips #talk"}
+    assert data["defaults"]["tiktok"]["title"] == "Watch this\n\n#clips #talk"
+    assert call(port, "GET", f"/api/videos/{vid}/publish/9")[0] == 404
+
+    calls = []
+
+    def fake_publish(w, c, name, form, again=False):
+        calls.append((w, c["file"], name, form, again))
+        return {"id": "x", "status": "published"}
+
+    monkeypatch.setattr(pub, "publish_clip", fake_publish)
+    status, job, _ = call(port, "POST", f"/api/videos/{vid}/publish/1",
+                          {"platform": "tiktok", "form": {"privacy": "SELF_ONLY"}, "again": True})
+    assert status == 201 and job["kind"] == "publish" and job["label"] == "Post to TikTok: The hook"
+    for _ in range(50):
+        state = call(port, "GET", f"/api/jobs/{job['id']}")[1]["state"]
+        if state not in ("queued", "running"):
+            break
+        time.sleep(0.1)
+    assert state == "done" and calls == [(work, "01_hook.mp4", "tiktok", {"privacy": "SELF_ONLY"}, True)]
+    assert any(j["id"] == job["id"] for j in call(port, "GET", "/api/jobs")[1])
+    assert call(port, "POST", f"/api/videos/{vid}/publish/1", {"platform": "myspace"})[0] == 400
