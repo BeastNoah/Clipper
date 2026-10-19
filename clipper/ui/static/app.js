@@ -238,7 +238,8 @@ async function startJob(source) {
   store.set("clipper.reviewFirst", review);
   try {
     const focus = $("#focus")?.value.trim() || null;
-    const job = await api.post("/api/jobs", { kind: "process", source, review, options: { ...options(), prompt: focus } });
+    const campaign = selectedCampaign()?.brief || null;
+    const job = await api.post("/api/jobs", { kind: "process", source, review, options: { ...options(), prompt: focus, campaign } });
     S.followJob = job.id;
     S.openLogs.add(job.id);
     toast("Started");
@@ -331,6 +332,7 @@ async function renderHome() {
       h("div", { class: "source-row" }, input, h("button", { class: "btn primary big", onclick: go }, "Start")),
       h("input", { type: "text", id: "focus", autocomplete: "off",
         placeholder: "Optional: what should Claude look for? e.g. funny moments, everything about pricing" }),
+      h("div", { class: "row campaign-row", id: "campaign-row" }),
       drop,
       h("div", { class: "quick" },
         ...settingsFields(opts, ["num_clips", "min_len", "max_len"]),
@@ -362,6 +364,7 @@ async function renderHome() {
     h("section", {}, h("h2", {}, "Library"), h("div", { id: "library" }, h("div", { class: "muted" }, "Loading…"))),
   ));
   renderJobs();
+  loadCampaigns();
   loadTrending();
   refreshLibrary();
 }
@@ -896,7 +899,7 @@ function clipsView() {
   const v = S.video;
   const clips = (v.rendered || []).filter(c => c.file);
   if (!clips.length) return h("div", { class: "panel empty" }, "No clips rendered yet. Pick clips in Review and press Render.");
-  return h("div", { class: "clips" }, clips.map(c => clipCard(v, c)));
+  return h("div", {}, clipsToolbar(v, clips), h("div", { class: "clips" }, clips.map(c => clipCard(v, c))));
 }
 
 function clipCard(v, c) {
@@ -1106,7 +1109,7 @@ async function openPublish(v, c, box, platform) {
     return;
   }
   const done = data.published[platform];
-  const build = again => publishForm(v, c, box, area, acct, data.defaults[platform] || {}, again);
+  const build = again => publishForm(v, c, box, area, acct, data.defaults[platform] || {}, again, data.campaign);
   if (done && done.status !== "failed") {
     area.append(
       h("p", { class: "small" }, `Already posted to ${acct.label}`, done.url ? [": ", h("a", { href: done.url, target: "_blank", rel: "noopener" }, done.url)] : ".",
@@ -1117,7 +1120,7 @@ async function openPublish(v, c, box, platform) {
   build(false);
 }
 
-async function publishForm(v, c, box, area, acct, defaults, again) {
+async function publishForm(v, c, box, area, acct, defaults, again, campaign) {
   area.append(h("div", { class: "small muted" }, "Loading your account…"));
   let opts;
   try { opts = await api.get(`/api/accounts/${acct.name}/options`); }
@@ -1175,13 +1178,16 @@ async function publishForm(v, c, box, area, acct, defaults, again) {
       button.title = commercial.checked && !(yours.checked || branded.checked)
         ? "Say whether the post promotes yourself, a third party, or both" : "";
     };
-    valid = () => !tooLong && privacy.value && (!commercial.checked || yours.checked || branded.checked);
+    const mustDisclose = !!campaign?.rules?.disclosure;
+    valid = () => !tooLong && privacy.value && (!commercial.checked || yours.checked || branded.checked)
+      && (!mustDisclose || (commercial.checked && branded.checked));
     [privacy, commercial, yours, branded].forEach(el => el.addEventListener("change", update));
     parts.push(
       field("Caption", title),
       field("Who can see it", privacy, opts.privacy_options.length === 1 && opts.privacy_options[0] === "SELF_ONLY"
         ? "Until TikTok audits your app, posts are visible only to you, and your account must be set to private." : null),
       h("div", { class: "checks" }, commentLabel, duetLabel, stitchLabel),
+      mustDisclose ? h("div", { class: "notice" }, "This campaign is a paid partnership: turn on “promotes a brand” and “Branded content” to post.") : null,
       commercialLabel, brandBox,
       tooLong ? h("div", { class: "error" }, `This clip is ${Math.round(duration)}s; your account can post up to ${opts.max_duration}s.`) : null,
       consent,
@@ -1206,6 +1212,292 @@ async function publishForm(v, c, box, area, acct, defaults, again) {
     h("button", { class: "btn ghost", type: "button", onclick: () => { box.hidden = true; } }, "Cancel")));
   area.replaceChildren(form);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Campaigns: a brand's clipping brief (Content Rewards and the like), followed while clipping and posting
+
+S.campaigns = [];
+
+async function loadCampaigns() {
+  try { S.campaigns = await api.get("/api/campaigns"); } catch { S.campaigns = []; }
+  renderCampaignPick();
+}
+
+function selectedCampaign() {
+  const id = store.get("clipper.campaign", null);
+  return S.campaigns.find(c => c.id === id) || null;
+}
+
+const PLATFORM_LIST = r => (r.platforms || []).map(p => PLATFORM_NAMES[p] || p).join(", ");
+
+function rulesLine(r) {
+  if (!r) return "";
+  return [r.min_len || r.max_len ? `${r.min_len ?? "?"}–${r.max_len ?? "?"}s` : null,
+    ...(r.mentions || []), ...(r.hashtags || []).map(t => `#${t}`), r.disclosure ? "#ad" : null,
+    r.platforms?.length ? PLATFORM_LIST(r) : null].filter(Boolean).join(" · ");
+}
+
+function rulesView(r, list) {
+  const row = (label, value) => value ? [h("dt", {}, label), h("dd", {}, value)] : [];
+  return h("div", {},
+    h("dl", { class: "rules" },
+      row("Looks for", r.focus), row("Leaves out", (r.avoid || []).join("; ")),
+      row("Clip length", r.min_len || r.max_len ? `${r.min_len ?? "any"} to ${r.max_len ?? "any"} seconds` : null),
+      row("Tags", (r.mentions || []).join(" ")), row("Hashtags", (r.hashtags || []).map(t => `#${t}`).join(" ")),
+      row("Every caption has", (r.must_include || []).join(" | ")), row("Caption style", r.caption_notes),
+      row("Ad label", r.disclosure ? "Yes: #ad, and TikTok's branded content switch" : null),
+      row("Platforms", PLATFORM_LIST(r)), row("On the video", r.on_screen_text),
+      row("Watermark", r.no_watermark ? "None allowed: your logo and watermark are left off" : null)),
+    list?.length ? h("div", {}, h("div", { class: "small muted" }, "Left for you to check:"),
+      h("ul", { class: "small" }, list.map(t => h("li", {}, t)))) : null);
+}
+
+function renderCampaignPick() {
+  const box = $("#campaign-row");
+  if (!box) return;
+  const cur = selectedCampaign();
+  const sel = h("select", { "aria-label": "Campaign", onchange: e => {
+    if (e.target.value === "__new") { renderCampaignPick(); showCampaign(null); return; }
+    store.set("clipper.campaign", e.target.value || null);
+    renderCampaignPick();
+  } },
+    h("option", { value: "" }, "No campaign"),
+    S.campaigns.map(c => h("option", { value: c.id, selected: cur?.id === c.id }, c.name)),
+    h("option", { value: "__new" }, "+ New campaign…"));
+  box.replaceChildren(h("span", { class: "small" }, "Campaign"), sel,
+    cur ? h("button", { class: "btn ghost small", type: "button", onclick: () => showCampaign(cur) }, "View") : null,
+    h("span", { class: "small muted grow" }, cur ? rulesLine(cur.rules)
+      : "Clipping for a brand's campaign? Paste its instructions and clipper follows them, from picking moments to the post text."));
+}
+
+function showCampaign(c) {
+  const dialog = $("#campaign-dialog"), body = $("#campaign-body");
+  const name = h("input", { type: "text", placeholder: "Name, e.g. the brand", value: c?.name || "" });
+  const brief = h("textarea", { rows: 10, placeholder: "Paste the campaign's instructions here, exactly as the brand wrote them: what to clip, length, hashtags, tags, captions, where to post…" }, c?.brief || "");
+  const result = h("div", {}, c?.rules ? rulesView(c.rules, c.checklist || null) : null);
+  const save = h("button", { class: "btn primary small", type: "button", onclick: async () => {
+    save.disabled = true;
+    result.replaceChildren(h("div", { class: "small muted" }, "Claude is reading the brief… (about half a minute)"));
+    try {
+      const item = await api.post("/api/campaigns", { id: c?.id, name: name.value, brief: brief.value, model: options().model });
+      store.set("clipper.campaign", item.id);
+      c = item;
+      name.value = item.name;
+      result.replaceChildren(h("div", { class: "small", style: "margin:8px 0" }, "Here's what clipper will do. New clips use this campaign while it's chosen on the start page."),
+        rulesView(item.rules, item.checklist));
+      del.hidden = false;
+      loadCampaigns();
+    } catch (e) { result.replaceChildren(h("div", { class: "error" }, e.message)); }
+    save.disabled = false;
+  } }, "Save and read the brief");
+  const del = h("button", { class: "btn ghost danger small", type: "button", hidden: !c, onclick: async () => {
+    if (!c || !confirm(`Delete the campaign “${c.name}”? Clips already made for it keep its rules.`)) return;
+    try { S.campaigns = await api.post(`/api/campaigns/${c.id}/delete`, {}); } catch (e) { return toast(e.message); }
+    if (store.get("clipper.campaign", null) === c.id) store.set("clipper.campaign", null);
+    dialog.close();
+    renderCampaignPick();
+  } }, "Delete");
+  body.replaceChildren(
+    h("p", { class: "small muted" }, "Claude reads the brief once and turns it into rules: what moments to pick, how long the clips are, what every caption must contain, and whether posts are marked as an ad. Required hashtags, tags and phrases are always added to the post text."),
+    h("label", { class: "field" }, h("span", {}, "Name"), name),
+    h("label", { class: "field", style: "margin-top:10px" }, h("span", {}, "Instructions"), brief),
+    h("div", { class: "row", style: "gap:8px; margin-top:10px" }, save, del),
+    result);
+  if (!dialog.open) dialog.showModal();
+}
+
+function clipsToolbar(v, clips) {
+  const camp = v.campaign;
+  const links = clips.flatMap(c => Object.entries((v.published || {})[c.file] || {})
+    .filter(([, r]) => r.url && r.status !== "failed").map(([name, r]) => ({ name, url: r.url, title: c.title })));
+  const checks = camp?.checklist?.length ? h("div", { class: "checklist" },
+    h("div", { class: "small muted" }, "Before you submit:"),
+    camp.checklist.map((t, i) => {
+      const key = `clipper.check.${v.id}.${i}`;
+      return h("label", { class: "check small" }, h("input", { type: "checkbox", checked: store.get(key, false),
+        onchange: e => store.set(key, e.target.checked) }), t);
+    })) : null;
+  return h("div", { class: "panel campaign-panel" },
+    camp ? h("div", { class: "row", style: "gap:8px" }, h("b", {}, `Campaign: ${camp.rules.name || "campaign"}`),
+      h("span", { class: "small muted grow" }, rulesLine(camp.rules))) : null,
+    checks,
+    h("div", { class: "row", style: "gap:8px" },
+      h("button", { class: "btn primary", onclick: () => showPostAll(v, clips) }, clips.length > 1 ? `Post all ${clips.length} clips` : "Post this clip"),
+      links.length ? h("button", { class: "btn", onclick: async () => {
+        try { await navigator.clipboard.writeText(links.map(l => l.url).join("\n")); toast("Copied: paste them into the campaign's submission form"); }
+        catch { toast("Couldn't copy"); }
+      } }, `Copy ${links.length} post link${links.length > 1 ? "s" : ""}`) : null,
+      h("span", { class: "small muted grow" }, links.length ? "For the campaign's submission form. TikTok only gives a link for public posts."
+        : "Posts every clip to the accounts you pick, one after another.")));
+}
+
+// Settings that apply to all the clips posted to one platform. TikTok's follow its content-sharing rules:
+// nothing preselected for who can see it or interactions, and an explicit choice about promotion.
+function platformSettings(acct, opts, campaign) {
+  const check = (label, attrs = {}) => { const box = h("input", { type: "checkbox", ...attrs }); return [box, h("label", { class: "check" }, box, label)]; };
+  const field = (label, input, hint) => h("label", { class: "field" }, h("span", {}, label), input, hint ? h("span", { class: "small muted" }, hint) : null);
+  const head = h("div", { class: "small muted" }, `${acct.label}: posting as ${opts.account || acct.account}`);
+  if (acct.name === "youtube") {
+    const privacy = h("select", {}, opts.privacy_options.map(p => h("option", { value: p }, p[0].toUpperCase() + p.slice(1))));
+    const [kids, kidsLabel] = check("Made for kids");
+    return { el: h("div", { class: "platform-settings" }, head, field("Who can see them", privacy), kidsLabel),
+      valid: () => true, fits: () => true,
+      form: d => ({ title: d.title, description: d.description, privacy: privacy.value, made_for_kids: kids.checked }) };
+  }
+  if (acct.name === "instagram") {
+    const [feed, feedLabel] = check("Also show them in the profile grid", { checked: true });
+    return { el: h("div", { class: "platform-settings" }, head, feedLabel), valid: () => true, fits: () => true,
+      form: d => ({ caption: d.caption, share_to_feed: feed.checked }) };
+  }
+  const privacy = h("select", {}, h("option", { value: "", disabled: true, selected: true }, "Choose…"),
+    opts.privacy_options.map(p => h("option", { value: p }, TIKTOK_PRIVACY[p] || p)));
+  const [comment, commentLabel] = check(opts.comment_disabled ? "Allow comments (off in your TikTok settings)" : "Allow comments", { disabled: opts.comment_disabled });
+  const [duet, duetLabel] = check(opts.duet_disabled ? "Allow Duet (off in your TikTok settings)" : "Allow Duet", { disabled: opts.duet_disabled });
+  const [stitch, stitchLabel] = check(opts.stitch_disabled ? "Allow Stitch (off in your TikTok settings)" : "Allow Stitch", { disabled: opts.stitch_disabled });
+  const [commercial, commercialLabel] = check("These posts promote a brand, product or service");
+  const [yours, yoursLabel] = check("Your brand: you're promoting yourself or your own business");
+  const [branded, brandedLabel] = check("Branded content: you're promoting another brand or a third party");
+  const brandBox = h("div", { class: "indent", hidden: true }, yoursLabel, brandedLabel);
+  const consent = h("div", { class: "small" });
+  const mustDisclose = !!campaign?.rules?.disclosure;
+  const onlyPrivate = opts.privacy_options.length === 1 && opts.privacy_options[0] === "SELF_ONLY";
+  const update = () => {
+    brandBox.hidden = !commercial.checked;
+    const isBranded = commercial.checked && branded.checked;
+    const selfOnly = [...privacy.options].find(o => o.value === "SELF_ONLY");
+    if (selfOnly) {
+      selfOnly.disabled = isBranded;
+      if (isBranded && privacy.value === "SELF_ONLY") privacy.value = "";
+    }
+    const link = (text, href) => h("a", { href, target: "_blank", rel: "noopener" }, text);
+    consent.replaceChildren("By posting, you agree to TikTok's ",
+      ...(isBranded ? [link("Branded Content Policy", "https://www.tiktok.com/legal/page/global/bc-policy/en"), " and "] : []),
+      link("Music Usage Confirmation", "https://www.tiktok.com/legal/page/global/music-usage-confirmation/en"), ".");
+    settings.onchange?.();
+  };
+  [privacy, commercial, yours, branded].forEach(el => el.addEventListener("change", update));
+  const settings = {
+    el: h("div", { class: "platform-settings" }, head,
+      field("Who can see them", privacy, opts.privacy_options.length === 1 && opts.privacy_options[0] === "SELF_ONLY"
+        ? "Until TikTok audits your app, posts are visible only to you, and your account must be set to private." : null),
+      h("div", { class: "checks" }, commentLabel, duetLabel, stitchLabel),
+      mustDisclose ? h("div", { class: "notice" }, onlyPrivate
+        ? "This campaign is a paid partnership, and TikTok only takes branded content as a public post. Your TikTok app can only post privately until TikTok audits it, so post these to TikTok by hand for now (Download on each clip)."
+        : "This campaign is a paid partnership: turn on “promote a brand” and “Branded content”.") : null,
+      commercialLabel, brandBox, consent),
+    valid: () => !!privacy.value && (!commercial.checked || yours.checked || branded.checked)
+      && (!mustDisclose || (commercial.checked && branded.checked)),
+    problem: () => mustDisclose && onlyPrivate ? "untick TikTok: it can't take this campaign's posts from your app yet"
+      : !privacy.value ? "choose who can see the TikTok posts"
+      : mustDisclose && !(commercial.checked && branded.checked) ? "mark the TikTok posts as branded content"
+      : commercial.checked && !(yours.checked || branded.checked) ? "say who the TikTok posts promote" : "",
+    fits: c => !opts.max_duration || (c.final_duration || c.duration) <= opts.max_duration,
+    form: d => ({ title: d.title, privacy: privacy.value, allow_comment: comment.checked, allow_duet: duet.checked,
+      allow_stitch: stitch.checked, commercial: commercial.checked, your_brand: yours.checked,
+      branded_content: branded.checked, consent: true }),
+  };
+  setTimeout(update, 0);
+  return settings;
+}
+
+async function showPostAll(v, clips) {
+  const dialog = $("#postall-dialog"), body = $("#postall-body");
+  body.replaceChildren(h("div", { class: "small muted" }, "Loading…"));
+  if (!dialog.open) dialog.showModal();
+  let accounts, details;
+  try {
+    accounts = await api.get("/api/accounts");
+    details = await Promise.all(clips.map(c => api.get(`/api/videos/${v.id}/publish/${c.rank}`)));
+  } catch (e) { body.replaceChildren(h("div", { class: "error" }, e.message), closeRow()); return; }
+  const camp = v.campaign;
+  const connected = accounts.filter(a => a.connected);
+  if (!connected.length) {
+    body.replaceChildren(h("p", {}, "Connect at least one account first."),
+      h("div", { class: "row", style: "gap:8px" }, h("button", { class: "btn primary", onclick: () => { dialog.close(); showAccounts(); } }, "Open Accounts"), closeBtn()));
+    return;
+  }
+  const allowed = camp?.rules?.platforms?.length ? camp.rules.platforms : null;
+  const chosen = new Map();  // platform name -> its settings
+  const settingsBox = h("div", { class: "stack-s" });
+  const clipsBox = h("div", { class: "postall-clips" });
+  const status = h("span", { class: "small muted grow" });
+  const go = h("button", { class: "btn primary", type: "button" }, "Post");
+
+  const platformToggles = h("div", { class: "row", style: "gap:14px" }, connected.map(a => {
+    const off = allowed && !allowed.includes(a.name);
+    const box = h("input", { type: "checkbox", checked: !off, onchange: () => toggle(a, box.checked) });
+    if (!off) setTimeout(() => toggle(a, true), 0);
+    return h("label", { class: "check" }, box, a.label, off ? h("span", { class: "small muted" }, " (not part of this campaign)") : null);
+  }));
+  const toggle = async (a, on) => {
+    if (!on) { chosen.get(a.name)?.el.remove(); chosen.delete(a.name); return refresh(); }
+    const holder = h("div", { class: "small muted" }, `Loading your ${a.label} account…`);
+    settingsBox.append(holder);
+    try {
+      const opts = await api.get(`/api/accounts/${a.name}/options`);
+      const st = platformSettings(a, opts, camp);
+      st.onchange = refresh;
+      holder.replaceWith(st.el);
+      chosen.set(a.name, st);
+    } catch (e) { holder.className = "error"; holder.textContent = `${a.label}: ${e.message}`; }
+    refresh();
+  };
+
+  // One row per clip: post it or not, and its text for each platform (Claude's, with the campaign's rules applied).
+  const rows = clips.map((c, i) => {
+    const d = details[i].defaults, done = details[i].published;
+    const pick = h("input", { type: "checkbox", checked: true, onchange: () => refresh() });
+    const yt = { title: h("input", { maxlength: 100, value: d.youtube.title }), description: h("textarea", { rows: 3 }, d.youtube.description) };
+    const tt = h("textarea", { rows: 3, maxlength: 2200 }, d.tiktok.title);
+    const ig = h("textarea", { rows: 3 }, d.instagram.caption);
+    const texts = { youtube: h("div", {}, h("div", { class: "small muted" }, "YouTube"), yt.title, yt.description),
+      tiktok: h("div", {}, h("div", { class: "small muted" }, "TikTok"), tt), instagram: h("div", {}, h("div", { class: "small muted" }, "Instagram"), ig) };
+    const note = h("span", { class: "small muted" });
+    const edit = h("details", {}, h("summary", { class: "small" }, "Edit text"), h("div", { class: "stack-s" }, ...Object.values(texts)));
+    const el = h("div", { class: "postall-clip" },
+      h("label", { class: "check" }, pick, `${c.rank}. ${c.title}`, h("span", { class: "small muted" }, ` ${Math.round(c.final_duration || c.duration)}s`)),
+      note, edit);
+    return { c, el, pick, done, note, texts,
+      data: name => name === "youtube" ? { title: yt.title.value, description: yt.description.value }
+        : name === "tiktok" ? { title: tt.value } : { caption: ig.value } };
+  });
+  clipsBox.replaceChildren(...rows.map(r => r.el));
+
+  const plan = () => rows.filter(r => r.pick.checked).flatMap(r => [...chosen.entries()]
+    .filter(([name, st]) => !(r.done[name] && r.done[name].status !== "failed") && st.fits(r.c))
+    .map(([name, st]) => ({ rank: r.c.rank, platform: name, form: st.form(r.data(name)) })));
+  function refresh() {
+    for (const r of rows) {
+      Object.entries(r.texts).forEach(([name, el]) => { el.hidden = !chosen.has(name); });
+      const already = [...chosen.keys()].filter(n => r.done[n] && r.done[n].status !== "failed").map(n => PLATFORM_NAMES[n]);
+      const tooLong = [...chosen.entries()].filter(([, st]) => !st.fits(r.c)).map(([n]) => PLATFORM_NAMES[n]);
+      r.note.textContent = [already.length && `already on ${already.join(", ")}`, tooLong.length && `too long for ${tooLong.join(", ")}`].filter(Boolean).join(" · ");
+    }
+    const n = plan().length, problem = [...chosen.values()].map(st => st.problem?.()).find(Boolean);
+    go.disabled = !n || !!problem || ![...chosen.values()].every(st => st.valid());
+    go.textContent = n ? `Post ${n} video${n > 1 ? "s" : ""}` : "Post";
+    status.textContent = problem ? `First ${problem}.` : !chosen.size ? "Pick where to post." : !n ? "Nothing new to post." : "";
+  }
+  go.onclick = async () => {
+    go.disabled = true;
+    try {
+      const jobs = await api.post(`/api/videos/${v.id}/publish-all`, { posts: plan() });
+      dialog.close();
+      toast(`Posting ${jobs.length} video${jobs.length > 1 ? "s" : ""}, one after another. You can keep working.`);
+      pollJobs();
+    } catch (e) { toast(e.message); refresh(); }
+  };
+  body.replaceChildren(
+    camp ? h("p", { class: "small" }, `For the campaign ${camp.rules.name || ""}: the captions already have its hashtags, tags and required text.`) : null,
+    h("div", { class: "group" }, h("div", { class: "group-head" }, "Post to"), platformToggles),
+    settingsBox,
+    h("div", { class: "group", style: "margin-top:12px" }, h("div", { class: "group-head" }, "Clips"), clipsBox),
+    h("div", { class: "row", style: "gap:8px; margin-top:14px" }, go, closeBtn(), status));
+  refresh();
+}
+
+function closeBtn() { return h("button", { class: "btn ghost", type: "button", onclick: () => $("#postall-dialog").close() }, "Cancel"); }
+function closeRow() { return h("div", { class: "row", style: "margin-top:10px" }, closeBtn()); }
 
 // ---------------------------------------------------------------------------------------------
 // Router

@@ -34,10 +34,12 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import publish as pub
+from ..campaign import checklist, delete_campaign, interpret, load_campaigns, save_campaign, video_campaign
 from ..captions import PRESETS
 from ..edit import MODES as JUMP_CUT_MODES
 from ..formats import SIZES
 from ..ingest import local_source
+from ..llm import Claude
 from ..pipeline import (
     Options, caption_lines, clip_dir_for, edited_words, find_new_clips, load_video, process, produce_reviewed, rerender,
     save_caption_lines,
@@ -200,7 +202,16 @@ def video_detail(work: Path) -> dict:
     posts = work / "posts.json"
     data["has_posts"] = posts.exists()
     data["published"] = pub.published(work)
+    data["campaign"] = campaign_summary(work)
     return data
+
+
+def campaign_summary(work: Path) -> dict | None:
+    """The campaign a video's clips were made for: its rules and the checklist, for the video page."""
+    camp = video_campaign(work)
+    if not camp:
+        return None
+    return {"rules": camp["rules"], "checklist": checklist(camp["rules"]), "brief": camp["brief"]}
 
 
 def source_video(work: Path) -> Path | None:
@@ -430,7 +441,8 @@ class Handler(BaseHTTPRequestHandler):
                 if clip is None or not clip.get("file"):
                     return self._error(404, "no such clip")
                 return self._json({"accounts": pub.status(), "defaults": post_defaults(clip),
-                                   "published": pub.published(work).get(clip["file"], {})})
+                                   "published": pub.published(work).get(clip["file"], {}),
+                                   "campaign": campaign_summary(work)})
             if route[2:] == ["frame"]:
                 try:
                     t = float((qs.get("t") or ["0"])[0])
@@ -445,6 +457,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(self.app.trending.state())
         if route == ["creators"]:
             return self._json(load_creators(self.app.root))
+        if route == ["campaigns"]:
+            return self._json(load_campaigns(self.app.root))
         if len(route) == 3 and route[0] == "accounts" and route[2] == "options":
             try:  # fetched every time the publish form opens (TikTok requires current creator info)
                 return self._json(pub.options(route[1]))
@@ -501,6 +515,27 @@ class Handler(BaseHTTPRequestHandler):
             except (ClipperError, ValueError, TypeError) as e:
                 return self._error(400, str(e))
             return self._json(job.public(), 201)
+        if len(parts) == 4 and parts[:2] == ["api", "videos"] and parts[3] == "publish-all":
+            work = self._work(parts[2])
+            if work is None:
+                return self._error(404, "no such video")
+            try:
+                jobs = self.app.publish_all(work, self._body())
+            except (ClipperError, ValueError, TypeError, KeyError) as e:
+                return self._error(400, str(e))
+            return self._json([j.public() for j in jobs], 201)
+        if parts == ["api", "campaigns"]:
+            body = self._body()
+            try:
+                model = body.get("model") if body.get("model") in ("opus", "sonnet", "haiku") else "opus"
+                rules = interpret(body.get("brief"), self.app.root, lambda: Claude(model, cwd=self.app.root))
+                item = save_campaign(self.app.root, body.get("name"), body.get("brief"), rules, body.get("id"))
+            except ClipperError as e:
+                return self._error(400, str(e))
+            return self._json({**item, "checklist": checklist(rules)}, 201)
+        if len(parts) == 4 and parts[:2] == ["api", "campaigns"] and parts[3] == "delete":
+            delete_campaign(self.app.root, parts[2])
+            return self._json(load_campaigns(self.app.root))
         if len(parts) == 4 and parts[:2] == ["api", "accounts"]:
             return self._account_action(parts[2], parts[3])
         if parts == ["api", "trending", "refresh"]:
@@ -602,11 +637,12 @@ class Handler(BaseHTTPRequestHandler):
 def post_defaults(clip: dict) -> dict:
     """Claude's post text for each platform, as the publish form's starting point."""
     post = clip.get("post") or {}
-    tags = " ".join("#" + t.lstrip("#") for t in post.get("hashtags") or [])
+    tags = ["#" + t.lstrip("#") for t in post.get("hashtags") or []]
 
     def with_tags(text: str) -> str:
         text = (text or "").strip()
-        return text if not tags or tags in text else f"{text}\n\n{tags}".strip()
+        missing = " ".join(t for t in tags if not re.search(rf"{re.escape(t)}(?!\w)", text, re.I))
+        return f"{text}\n\n{missing}".strip() if missing else text
 
     return {
         "youtube": {"title": (post.get("youtube_title") or clip["title"])[:100],
@@ -701,6 +737,31 @@ class App:
         def run(job: Job) -> None:
             pub.publish_clip(work, clip, platform, form, again=again)
         return self.uploads.submit(Job("publish", f"Post to {label}: {clip['title']}", run, video=work.name))
+
+    def publish_all(self, work: Path, body: dict) -> list[Job]:
+        """Several clips to several platforms in one go: {"posts": [{"rank", "platform", "form"}, ...]}.
+        Everything is checked before the first upload is queued; the uploads then run one after another."""
+        posts = body.get("posts")
+        if not isinstance(posts, list) or not posts:
+            raise ValueError("Choose at least one clip and one platform")
+        done = pub.published(work)
+        todo = []
+        for item in posts:
+            clip = self.rendered_clip(work, str(item.get("rank")))
+            if clip is None or not clip.get("file"):
+                raise ValueError(f"Clip {item.get('rank')} hasn't been rendered")
+            platform = str(item.get("platform") or "")
+            if platform not in pub.PLATFORMS:
+                raise ValueError("Choose a platform to post to")
+            if not isinstance(item.get("form"), dict):
+                raise ValueError("form must be an object")
+            old = done.get(clip["file"], {}).get(platform)
+            if old and old.get("status") != "failed" and not body.get("again"):
+                continue  # already there: posting it twice by accident would hurt the account
+            todo.append((clip, platform, item["form"]))
+        if not todo:
+            raise ValueError("These clips are already posted there")
+        return [self.publish_job(work, clip, platform, form, bool(body.get("again"))) for clip, platform, form in todo]
 
     def rendered_clip(self, work: Path, rank: str) -> dict | None:
         path = work / "output" / "clips.json"

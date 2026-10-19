@@ -336,3 +336,46 @@ def test_publishing_routes(server, tmp_path, monkeypatch):
     assert state == "done" and calls == [(work, "01_hook.mp4", "tiktok", {"privacy": "SELF_ONLY"}, True)]
     assert any(j["id"] == job["id"] for j in call(port, "GET", "/api/jobs")[1])
     assert call(port, "POST", f"/api/videos/{vid}/publish/1", {"platform": "myspace"})[0] == 400
+
+
+def test_campaigns_and_posting_several_clips(server, tmp_path, monkeypatch):
+    import clipper.publish as pub
+
+    port, work, _ = server
+    vid = work.name
+    monkeypatch.setenv("CLIPPER_CONFIG", str(tmp_path / "cfg"))
+    assert call(port, "GET", "/api/campaigns")[1] == []
+    status, item, _ = call(port, "POST", "/api/campaigns", {"name": "", "brief": "BrandX: tag @brandx", "model": "haiku"})
+    assert status == 201 and item["name"] == "BrandX" and item["rules"]["mentions"] == ["@brandx"]
+    assert "Use a trending sound" in item["checklist"]
+    assert [c["id"] for c in call(port, "GET", "/api/campaigns")[1]] == [item["id"]]
+    assert call(port, "POST", "/api/campaigns", {"brief": " "})[0] == 400
+    assert call(port, "POST", f"/api/campaigns/{item['id']}/delete", {})[1] == []
+
+    out = work / "output"
+    out.mkdir(exist_ok=True)
+    clips = []
+    for n in (1, 2):
+        (out / f"0{n}_c.mp4").write_bytes(b"v" * 100)
+        clips.append({"rank": n, "id": f"c{n}", "title": f"Clip {n}", "file": f"0{n}_c.mp4", "start": 1.0, "end": 9.0})
+    write_json(out / "clips.json", clips)
+    write_json(work / "campaign.json", {"brief": "b", "rules": item["rules"]})
+    write_json(out / "published.json", {"02_c.mp4": {"tiktok": {"status": "published", "url": "https://t/1"}}})
+    detail = call(port, "GET", f"/api/videos/{vid}")[1]
+    assert detail["campaign"]["rules"]["name"] == "BrandX" and detail["campaign"]["checklist"]
+    assert call(port, "GET", f"/api/videos/{vid}/publish/1")[1]["campaign"]["rules"]["disclosure"] is True
+
+    calls = []
+    monkeypatch.setattr(pub, "publish_clip", lambda w, c, name, form, again=False: calls.append((c["rank"], name, form)) or {})
+    posts = [{"rank": r, "platform": p, "form": {"title": f"t{r}"}} for r in (1, 2) for p in ("tiktok", "youtube")]
+    status, jobs, _ = call(port, "POST", f"/api/videos/{vid}/publish-all", {"posts": posts})
+    assert status == 201 and len(jobs) == 3  # clip 2 is already on TikTok
+    for _ in range(50):
+        if len(calls) == 3:
+            break
+        time.sleep(0.1)
+    assert calls == [(1, "tiktok", {"title": "t1"}), (1, "youtube", {"title": "t1"}), (2, "youtube", {"title": "t2"})]
+    for bad in ({"posts": []}, {"posts": [{"rank": 9, "platform": "tiktok", "form": {}}]},
+                {"posts": [{"rank": 1, "platform": "myspace", "form": {}}]},
+                {"posts": [{"rank": 2, "platform": "tiktok", "form": {}}]}):
+        assert call(port, "POST", f"/api/videos/{vid}/publish-all", bad)[0] == 400

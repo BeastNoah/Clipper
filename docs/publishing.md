@@ -88,3 +88,19 @@ account in 24 hours through the API.
 - **TikTok "only you can see it"**: expected until TikTok audits your app.
 - **Instagram "No Instagram professional account is linked"**: check step 1 above.
 - The Graph API version defaults to `v24.0`. Set `CLIPPER_META_GRAPH_VERSION` if Meta retires it.
+
+## Posting several clips at once
+
+On a video's **Clips** tab, **Post all clips** posts every clip to the accounts you pick in one go.
+You choose the platforms, set who can see the posts once for each platform (on TikTok nothing is
+preselected, as TikTok's rules require), and can check and edit every caption before pressing
+**Post**. clipper then uploads the clips one after another in the background. Clips already posted
+to a platform are skipped, and a clip that's longer than your TikTok account allows is left out of
+TikTok.
+
+When the clips were made for a [campaign](../README.md#the-web-interface), its rules are already
+in the captions: the required hashtags, @tags and text, and `#ad` for paid partnerships. Only the
+campaign's platforms are ticked, and for a paid partnership TikTok posting waits until you mark the
+posts as branded content. Afterwards **Copy post links** copies the links of every posted clip, for
+the campaign's submission form. TikTok only gives clipper a link for public posts, so posts that
+are visible only to you (before TikTok audits your app) have none.

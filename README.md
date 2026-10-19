@@ -60,6 +60,22 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   "More settings" has the rest: a time range, formats, translation, a watermark (your own text,
   and/or a picture you upload or a logo file), zoom, progress bar,
   caption style and more.
+- **Campaigns:** clipping for a brand's paid campaign (Content Rewards, Whop and the like)? Under
+  **Campaign** on the start page, choose **New campaign** and paste the campaign's instructions as
+  the brand wrote them. Claude reads them once and shows what clipper will do: the moments to look
+  for and to leave out, the clip length, the hashtags, @tags and exact text every caption must have,
+  whether posts are a paid partnership (`#ad`, and TikTok's branded content switch), which platforms
+  count, text the brand wants on the video, and whether your own watermark has to go. While the
+  campaign is chosen, new videos follow it: the picking, the lengths, the look and the post text.
+  The required hashtags, tags and text are added to every caption by clipper itself, so none get
+  forgotten. Anything clipper can't do for you (use a trending sound, submit within 48 hours, …)
+  becomes a checklist on the video's page. Saved campaigns are kept in `work/campaigns.json`.
+- **Post all clips:** on a video's **Clips** tab, post every clip to your connected accounts in one
+  go: pick the platforms (only the campaign's are ticked), set who can see the posts once per
+  platform, check or edit each caption, and press **Post**. The uploads run one after another in the
+  background, and clips already posted somewhere are skipped. **Copy post links** then copies the
+  links of all posted clips, ready for the campaign's submission form. Accounts are set up once, see
+  [Publishing](docs/publishing.md).
 - **Review:** with "Let me review the clips before rendering" ticked, clipper stops after Claude
   has made its suggestions. Each suggestion shows Claude's score and sub-scores, the kind of moment
   (joke, story, hot take, …), the hook, the highlight keywords and whether Claude thinks it repeats
@@ -119,6 +135,7 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--min-len` / `--max-len` | 20 / 60 | clip length limits in seconds |
 | `--model` | `opus` | Claude model that picks the clips (`opus`, `sonnet`, `haiku` or a full name) |
 | `--prompt TEXT` | | what Claude should look for, e.g. `"funny moments"` or `"everything about pricing"` |
+| `--campaign FILE` | | follow a clipping campaign's instructions (a text file with the brief, or the text itself): what to clip, clip length, on-screen text and the post text's hashtags, tags and `#ad` |
 | `--from` / `--to` | | only use part of the video, e.g. `--from 10:00 --to 45:00` |
 | `--no-earlier-parts` | | don't let Claude put earlier parts of the video (a joke's set-up, the question being answered) in front of a clip |
 | `--new-clips` | | for a video clipper has seen before: ask for clips at moments Claude hasn't suggested yet, and make them alongside the clips already made |

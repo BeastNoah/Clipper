@@ -38,6 +38,9 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     g.add_argument("--min-len", type=float, default=d.min_len, help="shortest clip in seconds (default 20)")
     g.add_argument("--max-len", type=float, default=d.max_len, help="longest clip in seconds (default 60)")
     g.add_argument("--model", default=d.model, help="Claude model that picks the clips (default opus)")
+    g.add_argument("--campaign", default=None, metavar="FILE|TEXT",
+                   help="a clipping campaign's instructions (a text file, or the text itself): clipper follows "
+                        "its rules for what to clip, clip length, on-screen text and the post text")
     g.add_argument("--prompt", default=None, metavar="TEXT",
                    help="what Claude should look for, e.g. 'funny moments' or 'everything about pricing'")
     g.add_argument("--new-clips", action="store_true",
@@ -103,10 +106,17 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _campaign(value: str | None) -> str | None:
+    """--campaign takes a file with the brief, or the brief itself."""
+    if value and len(value) < 1024 and Path(value).expanduser().is_file():
+        return Path(value).expanduser().read_text(encoding="utf-8")
+    return value
+
+
 def options_from_args(args: argparse.Namespace) -> Options:
     return Options(
         num_clips=args.num_clips, min_len=args.min_len, max_len=args.max_len, work_dir=args.work_dir,
-        download=args.download, prompt=args.prompt, range_start=args.range_start, range_end=args.range_end,
+        download=args.download, prompt=args.prompt, campaign=_campaign(args.campaign), range_start=args.range_start, range_end=args.range_end,
         caption_language=args.caption_language, formats=args.formats, zoom=not args.no_zoom,
         progress_bar=args.progress_bar, logo=args.logo, logo_position=args.logo_position,
         watermark=args.watermark, watermark_position=args.watermark_position,

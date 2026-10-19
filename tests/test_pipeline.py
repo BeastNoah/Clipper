@@ -111,6 +111,46 @@ def test_pipeline_with_formats_translation_logo_and_focus(tmp_path, fake_claude)
     assert any("looking for: the best bits" in p for p in prompts)
 
 
+def test_a_campaign_steers_the_clips_and_the_posts(tmp_path, fake_claude):
+    import cv2
+    import numpy as np
+
+    src = tmp_path / "talk.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25:duration=30",
+                    "-f", "lavfi", "-i", "sine=f=300:duration=30", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "aac", "-shortest", str(src)], check=True)
+    cv2.imwrite(str(tmp_path / "logo.png"), np.full((30, 60, 4), 255, np.uint8))
+    (tmp_path / "brief.txt").write_text("BrandX campaign: clips about our product, 8-12 seconds, tag @brandx.")
+    root = tmp_path / "work"
+    args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "30", "--max-len", "60", "--preset",
+            "ultrafast", "--caption-model", "none", "--campaign", str(tmp_path / "brief.txt"),
+            "--logo", str(tmp_path / "logo.png"), "--prompt", "funny bits"]
+    assert cli.main(args + ["--stop-after", "ingest"]) == 0
+    (work,) = [d for d in root.iterdir() if not d.name.startswith(".")]  # .campaigns: the brief, read
+    meta = json.loads((work / "meta.json").read_text())
+    write_json(work / "transcript.json", {
+        "params": {"version": 2, "model": "small", "backend": "faster-whisper", "language": None,
+                   "duration": round(meta["duration"], 2)},
+        "result": {"language": "en", "words": make_words([f"This is sentence number {i} today." for i in range(12)],
+                                                         start=0.5)}})
+    assert cli.main(args) == 0
+    camp = json.loads((work / "campaign.json").read_text())
+    assert camp["brief"].startswith("BrandX campaign") and camp["rules"]["mentions"] == ["@brandx"]
+    (clip,) = json.loads((work / "output" / "clips.json").read_text())
+    assert 8 <= clip["duration"] <= 14  # the campaign's lengths, not --min-len 30
+    post = clip["post"]
+    for text in (post["tiktok"], post["instagram"], post["youtube_description"]):
+        assert "@brandx" in text and "link in bio" in text and "#brandx" in text and "#ad" in text
+    assert post["hashtags"][:3] == ["brandx", "clips", "ad"]
+    ass = (work / "clips").glob("*/9x16/captions.ass").__next__().read_text()
+    assert "Watermark,,0,0,0,,@brandx" in ass  # the brand's on-screen text
+    prompts = [json.loads(l)["prompt"] for l in fake_claude.read_text().splitlines()]
+    assert sum("<brief>" in p for p in prompts) == 1  # read once, though the CLI ran twice
+    assert any("looking for: funny bits. moments about the product. Never pick moments with: swearing" in p
+               for p in prompts)
+    assert any("paid clipping campaign (BrandX)" in p and "tag @brandx" in p for p in prompts if '"posts"' in p)
+
+
 def test_whole_file_conversion_on_request(tmp_path, fake_claude):
     src = tmp_path / "talk.mov"
     subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=30",

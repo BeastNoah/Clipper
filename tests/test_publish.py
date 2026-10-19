@@ -249,6 +249,12 @@ def test_tiktok_rules_and_publish(api, tmp_path):
         publish.publish_clip(work, clip, "tiktok", good, again=True)
 
 
+def test_tiktok_post_links():
+    assert tiktok.post_url("noah", {"publicaly_available_post_id": [7312]}) == "https://www.tiktok.com/@noah/video/7312"
+    assert tiktok.post_url("noah", {"status": "PUBLISH_COMPLETE"}) is None  # private posts have no public link
+    assert tiktok.post_url(None, {"publicaly_available_post_id": [1]}) is None
+
+
 def test_tiktok_api_errors_are_reported(api):
     publish.save_app("tiktok", {"client_key": "ck", "client_secret": "cs"})
     store.accounts().put("tiktok", {"access_token": "tt", "expires_at": time.time() + 3600})

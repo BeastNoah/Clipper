@@ -103,7 +103,8 @@ class TikTok(Platform):
         }
 
     def publish(self, account: dict, video: Path, form: dict, duration: float) -> dict:
-        post_info = self.check(self.options(account), form, duration)  # fresh creator info, as required
+        info = self.options(account)  # fresh creator info, as required
+        post_info = self.check(info, form, duration)
         size = video.stat().st_size
         chunk_size, count = chunk_plan(size)
         init = self._api("POST", "/post/publish/video/init/", account, json_body={
@@ -125,14 +126,15 @@ class TikTok(Platform):
                     "Content-Range": f"bytes {first}-{last}/{size}",
                 })
                 progress.update(last + 1)
-        status = self._wait(account, publish_id)
+        data = self._wait(account, publish_id)
+        status = data.get("status") or "PROCESSING_UPLOAD"
         note = "TikTok is still processing the post; it can take a few minutes to appear."
         if status == "PUBLISH_COMPLETE":
             note = "Posted." + (" It's visible only to you until TikTok audits your app."
                                 if post_info["privacy_level"] == "SELF_ONLY" else "")
-        return {"id": publish_id, "url": None, "status": status.lower(), "note": note}
+        return {"id": publish_id, "url": post_url(info.get("username"), data), "status": status.lower(), "note": note}
 
-    def _wait(self, account: dict, publish_id: str) -> str:
+    def _wait(self, account: dict, publish_id: str) -> dict:
         deadline = time.time() + POLL_LIMIT
         while True:
             data = self._api("POST", "/post/publish/status/fetch/", account, json_body={"publish_id": publish_id})
@@ -140,7 +142,7 @@ class TikTok(Platform):
             if status == "FAILED":
                 raise PublishError(f"TikTok couldn't publish the video: {data.get('fail_reason') or 'unknown reason'}")
             if status in ("PUBLISH_COMPLETE", "SEND_TO_USER_INBOX") or time.time() > deadline:
-                return status
+                return data
             check_cancel()
             time.sleep(POLL_SECONDS)
 
@@ -158,6 +160,12 @@ class TikTok(Platform):
         if err.get("code") not in (None, "ok"):
             raise PublishError(f"TikTok: {err.get('message') or err.get('code')}")
         return body.get("data") or {}
+
+
+def post_url(username: str | None, status: dict) -> str | None:
+    """The public post's link, once TikTok has one (public posts only; the API spells the field this way)."""
+    ids = status.get("publicaly_available_post_id") or status.get("publicly_available_post_id") or []
+    return f"https://www.tiktok.com/@{username}/video/{ids[0]}" if username and ids else None
 
 
 def _account(tok: dict) -> dict:

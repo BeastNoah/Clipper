@@ -6,12 +6,13 @@ import hashlib
 import json
 import os
 import shutil
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from fractions import Fraction
 from pathlib import Path
 from typing import Callable
 
 from .audio import Loudness
+from .campaign import clean_brief, focus_with, interpret, lengths_with, video_campaign
 from .captions import PRESETS, Watermark, _phrases, build_srt, keyword_positions, make_captions, make_style, map_words
 from .edit import MODES as JUMP_CUT_MODES
 from .edit import EditMap, plan_cuts
@@ -39,6 +40,7 @@ class Options:
     min_len: float = 20
     max_len: float = 60
     prompt: str | None = None           # what Claude should look for, e.g. "funny moments"
+    campaign: str | None = None         # a clipping campaign's brief, as the brand wrote it (see campaign.py)
     range_start: float | str | None = None  # only use this part of the video (seconds or "12:30")
     range_end: float | str | None = None
     work_dir: str = "work"
@@ -106,6 +108,11 @@ class Options:
             setattr(self, name, value.strip() if isinstance(value, str) and value.strip() else None)
         if self.logo and not Path(self.logo).expanduser().is_file():
             problems.append(f"no logo file at {self.logo}")
+        if self.campaign is not None:
+            try:
+                self.campaign = clean_brief(self.campaign) if str(self.campaign).strip() else None
+            except ClipperError as e:
+                problems.append(str(e))
         if self.watermark and len(self.watermark) > 80:
             problems.append("keep the watermark text to 80 characters")
         if problems:
@@ -142,6 +149,26 @@ def watermark_for(opts: Options, fmt: Format, logo_shape: tuple[int, ...] | None
 
 def claude_factory(opts: Options, work: Path) -> Callable[[], Claude]:
     return lambda: Claude(opts.model, cwd=work)
+
+
+def with_campaign(opts: Options, root: Path, work: Path | None = None) -> Options:
+    """The options with the campaign's rules applied: what to look for, clip lengths, on-screen text.
+    Without a campaign of its own, a video that was made for one keeps it (e.g. when captions are fixed)."""
+    if getattr(opts, "rules", None) is not None or (not opts.campaign and not (work and video_campaign(work))):
+        return opts
+    brief = opts.campaign or video_campaign(work)["brief"]
+    rules = interpret(brief, root, claude_factory(opts, root))
+    min_len, max_len = lengths_with(opts.min_len, opts.max_len, rules)
+    out = replace(opts, campaign=brief, prompt=focus_with(opts.prompt, rules), min_len=min_len, max_len=max_len)
+    if rules.get("no_watermark") and (opts.logo or opts.watermark):
+        log("campaign: no watermarks allowed, so your logo and watermark are left off")
+        out.logo = out.watermark = None
+    if rules.get("on_screen_text"):
+        out.watermark = rules["on_screen_text"]
+    out.rules = rules
+    if work is not None:
+        write_json(work / "campaign.json", {"brief": brief, "rules": rules})
+    return out
 
 
 def _publish(src: Path, dest: Path) -> None:
@@ -267,6 +294,7 @@ def _prefetch(work: Path, meta: dict, clip: dict) -> None:
 
 def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: Options) -> list[dict]:
     """Steps 4-6 (reframe, captions, render) for clips that have already been chosen."""
+    opts = with_campaign(opts, work.parent, work)
     do_render = opts.stop_after not in ("reframe", "captions")
     if do_render:
         check_ffmpeg_has_libass()
@@ -366,7 +394,8 @@ def produce(work: Path, meta: dict, transcript: dict, clips: list[dict], opts: O
 
     if do_render and opts.posts:
         try:
-            posts = write_posts(work, meta, clips, claude, force=opts.forced("render"))
+            posts = write_posts(work, meta, clips, claude, force=opts.forced("render"),
+                                campaign=getattr(opts, "rules", None))
         except ClipperError as e:
             log(f"posts: skipped ({e})")
             posts = {}
@@ -395,6 +424,7 @@ def process(source: str, opts: Options, new_clips: bool = False) -> tuple[Path, 
     report("step", "ingest")
     work, meta = ingest(source, work_root, force=opts.forced("ingest"), download_mode=opts.download)
     report("video", work.name)
+    opts = with_campaign(opts, work_root, work)
     if opts.stop_after == "ingest":
         return work, []
     check_cancel()
@@ -434,6 +464,7 @@ def load_video(work: Path) -> dict:
 
 def produce_reviewed(work: Path, items: list[dict], opts: Options) -> list[dict]:
     """Render clips chosen (and possibly adjusted) by hand in the review screen."""
+    opts = with_campaign(opts, work.parent, work)
     meta = read_json(work / "meta.json")
     transcript = read_json(work / "transcript.json")["result"]
     candidates = saved_candidates(work)
@@ -452,6 +483,7 @@ def produce_reviewed(work: Path, items: list[dict], opts: Options) -> list[dict]
 def find_new_clips(work: Path, opts: Options, render: bool = False) -> list[dict]:
     """Ask Claude for clips at moments it hasn't suggested yet (for a video that's already transcribed).
     The earlier suggestions stay. With render, the new clips are made and added to the ones already made."""
+    opts = with_campaign(opts, work.parent, work)
     meta = read_json(work / "meta.json")
     if not (work / "transcript.json").exists():
         raise ClipperError("This video hasn't been transcribed yet.")

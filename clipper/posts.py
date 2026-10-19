@@ -7,6 +7,7 @@ from typing import Callable
 
 from pydantic import BaseModel, Field, ValidationError
 
+from .campaign import caption_guide, enforce_post
 from .llm import Claude, InvalidReply, extract_json
 from .util import fingerprint, log, read_json, write_json
 
@@ -45,7 +46,7 @@ def parse_posts(reply: str, ids: list[str]) -> dict[str, dict]:
             for i in ids}
 
 
-def _prompt(title: str, clips: list[dict]) -> str:
+def _prompt(title: str, clips: list[dict], campaign: dict | None = None) -> str:
     blocks = "\n\n".join(f"[{c['id']}] \"{c['title']}\"\n{c['text']}" for c in clips)
     return f"""\
 Video title: {title}
@@ -61,7 +62,7 @@ For each clip:
 - instagram: two or three sentences, then 5-8 hashtags
 - youtube_title: at most 70 characters, no hashtags
 - youtube_description: one or two sentences, then 3 hashtags
-- hashtags: the 5 most relevant hashtags, without the # sign
+- hashtags: the 5 most relevant hashtags, without the # sign{caption_guide(campaign)}
 
 Reply with only a JSON object in exactly this format, one entry per clip id:
 {{"posts": [{{"id": "{clips[0]['id']}", "tiktok": "...", "instagram": "...", "youtube_title": "...", \
@@ -69,23 +70,24 @@ Reply with only a JSON object in exactly this format, one entry per clip id:
 
 
 def write_posts(work: Path, meta: dict, clips: list[dict], claude_factory: Callable[[], Claude],
-                force: bool = False) -> dict[str, dict]:
-    """Post text per clip id. Stored per clip, so only clips without text yet go to Claude."""
+                force: bool = False, campaign: dict | None = None) -> dict[str, dict]:
+    """Post text per clip id. Stored per clip, so only clips without text yet go to Claude. With a
+    campaign, Claude follows its caption rules and its required hashtags and mentions are always added."""
     path = work / "posts.json"
     store = read_json(path) if path.exists() and not force else {}
     if store.get("version") != POSTS_VERSION:
         store = {"version": POSTS_VERSION, "posts": {}}
-    key = lambda c: fingerprint([c["title"], c["text"]])  # noqa: E731
+    key = lambda c: fingerprint([c["title"], c["text"]] + ([campaign] if campaign else []))  # noqa: E731
     todo = [c for c in clips if key(c) not in store["posts"]]
     if todo:
         log(f"posts: asking Claude for post text for {len(todo)} clip(s)")
         ids = [c["id"] for c in todo]
-        got = claude_factory().ask(SYSTEM_PROMPT, _prompt(meta.get("title", ""), todo),
+        got = claude_factory().ask(SYSTEM_PROMPT, _prompt(meta.get("title", ""), todo, campaign),
                                    lambda r: parse_posts(r, ids), what="post text")
         for c in todo:
             store["posts"][key(c)] = got[c["id"]]
         write_json(path, store)
-    return {c["id"]: store["posts"][key(c)] for c in clips}
+    return {c["id"]: enforce_post(store["posts"][key(c)], campaign) for c in clips}
 
 
 def format_post(clip: dict, post: dict) -> str:

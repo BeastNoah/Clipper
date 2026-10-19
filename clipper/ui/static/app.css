@@ -298,3 +298,20 @@ details[open] > summary::before { content: "▾ "; }
 .posted-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .posted { font-size: 12px; font-weight: 600; color: var(--good); background: color-mix(in srgb, var(--good) 12%, transparent);
   border-radius: 999px; padding: 3px 9px; text-decoration: none; }
+
+/* campaigns */
+.campaign-row { gap: 8px; flex-wrap: wrap; align-items: center; }
+.campaign-row select { width: auto; max-width: 260px; }
+.campaign-panel { margin-bottom: 16px; display: grid; gap: 10px; }
+.checklist { display: grid; gap: 4px; }
+.rules { display: grid; grid-template-columns: max-content 1fr; gap: 4px 14px; margin: 10px 0; font-size: 14px; }
+.rules dt { color: var(--muted); }
+.rules dd { margin: 0; }
+.notice { border-left: 3px solid var(--accent); padding: 6px 10px; background: var(--panel-2); font-size: 14px; border-radius: 4px; }
+.platform-settings { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: grid; gap: 8px; }
+.stack-s { display: grid; gap: 8px; }
+.postall-clips { display: grid; gap: 6px; max-height: 45vh; overflow: auto; }
+.postall-clip { border-bottom: 1px solid var(--line); padding: 6px 0; display: grid; gap: 4px; }
+.group { display: grid; gap: 6px; margin-bottom: 10px; }
+.group-head { font-size: 13px; color: var(--muted); font-weight: 550; }
+.postall-clip textarea, .postall-clip input:not([type=checkbox]) { width: 100%; margin-top: 4px; }

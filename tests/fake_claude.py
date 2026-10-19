@@ -10,6 +10,7 @@ FAKE_CLAUDE_BEFORE=1: the first clip starts at the fourth line and plays the fir
 FAKE_CLAUDE_DUP=1: when re-scoring, mark the second clip as a duplicate of the first.
 FAKE_CLAUDE_SLEEP: seconds to think before answering a request for clips.
 FAKE_CLAUDE_FAILS: a file holding a number; while it's above 0, fail (and count down) like a crashed CLI.
+A campaign brief (<brief>) always gets the same rules, for "BrandX".
 FAKE_CLAUDE_FAIL_FROM: fail every request for clips in a part of the transcript starting at or after
     this many seconds.
 """
@@ -54,6 +55,12 @@ if os.environ.get("FAKE_CLAUDE_FAIL_FROM") and "<transcript>" in prompt:
 
 if os.environ.get("FAKE_CLAUDE_BAD_FIRST") and not resume:
     reply("Sure! Here are some great clips: (no JSON, oops)")
+
+if "<brief>" in prompt:  # a campaign brief: these rules, whatever it says
+    reply({"name": "BrandX", "focus": "moments about the product", "avoid": ["swearing"], "min_len": 8,
+           "max_len": 12, "hashtags": ["#brandx", "clips"], "mentions": ["brandx"], "must_include": ["link in bio"],
+           "caption_notes": "casual", "disclosure": True, "platforms": ["TikTok", "YouTube Shorts", "myspace"],
+           "on_screen_text": "@brandx", "no_watermark": True, "manual": ["Use a trending sound"]})
 
 if "<transcript>" in prompt:
     time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0")))
