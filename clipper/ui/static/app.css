@@ -112,6 +112,9 @@ label.field { display: flex; flex-direction: column; gap: 6px; font-size: 13px; 
 label.field > span { white-space: nowrap; }
 label.check { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
 input[type=checkbox] { width: 18px; height: 18px; accent-color: var(--accent); }
+.settings-head { margin: 18px 0 2px; font-size: 14px; }
+.logo-field { grid-column: span 2; }
+.logo-preview { height: 28px; max-width: 90px; object-fit: contain; border-radius: 4px; background: repeating-conic-gradient(#8884 0 25%, transparent 0 50%) 0 0 / 10px 10px; }
 .settings { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; margin-top: 16px; }
 details > summary { cursor: pointer; color: var(--muted); font-weight: 600; font-size: 14px; list-style: none; }
 details > summary::before { content: "▸ "; }

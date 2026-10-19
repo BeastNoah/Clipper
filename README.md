@@ -57,7 +57,8 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
 
 - **Make clips:** paste a link or a file path, or drop a video file, and optionally say what Claude
   should look for ("funny moments", "everything about pricing"). Pick how many clips and how long;
-  "More settings" has the rest: a time range, formats, translation, logo, zoom, progress bar,
+  "More settings" has the rest: a time range, formats, translation, a watermark (your own text,
+  and/or a picture you upload or a logo file), zoom, progress bar,
   caption style and more.
 - **Review:** with "Let me review the clips before rendering" ticked, clipper stops after Claude
   has made its suggestions. Each suggestion shows Claude's score and sub-scores, the kind of moment
@@ -134,6 +135,8 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--no-zoom` | | no automatic zoom-ins on the hook and Claude's keywords |
 | `--progress-bar` | | a progress bar along the top |
 | `--logo FILE`, `--logo-position` | top-right | your logo on every clip (a PNG with transparency works best) |
+| `--watermark TEXT`, `--watermark-position` | bottom-left | your own text on every clip, e.g. `--watermark @yourname`; in the logo's corner it sits next to the logo |
+| `--watermark-opacity` | 90 | how solid the watermark text and the logo are, in percent (10-100) |
 | `--jump-cuts` | `on` | `on` cuts long pauses and filler words ("um", "äh"), `pauses` only pauses, `off` nothing |
 | `--layout` | `auto` | two people in a shot: `follow` whoever talks, `split` screen, `auto` (split during back-and-forth, follow otherwise), `main` person only |
 | `--encoder` | `auto` | `auto` uses the Mac's hardware encoder (`videotoolbox`: much faster, slightly bigger files) when there is one, else `x264` (best quality per MB) |

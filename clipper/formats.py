@@ -26,6 +26,14 @@ class Format:
         """A vertical distance designed for a 1920px-tall frame, scaled to this format."""
         return int(round(px_at_1920 * self.height / 1920))
 
+    def corner_margins(self) -> tuple[int, int, int]:
+        """Where the logo and watermark sit: the side margin, the distance from the top and from the bottom.
+        On vertical video they stay clear of the platforms' top bar and the caption block at the bottom."""
+        margin = int(min(self.width, self.height) * 0.04)
+        if self.ratio < 1:
+            return margin, self.v(150), self.v(330) + margin
+        return margin, margin, margin
+
 
 VERTICAL = Format("9:16", *SIZES["9:16"])
 

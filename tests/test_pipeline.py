@@ -84,6 +84,7 @@ def test_pipeline_with_formats_translation_logo_and_focus(tmp_path, fake_claude)
     args = [str(src), "--work-dir", str(root), "-n", "1", "--min-len", "8", "--max-len", "12", "--preset",
             "ultrafast", "--caption-model", "none", "--format", "9:16,1:1,16:9", "--caption-language", "English",
             "--logo", str(tmp_path / "logo.png"), "--progress-bar", "--prompt", "the best bits",
+            "--watermark", "@clipper {test}", "--watermark-position", "top-right",
             "--from", "0:10", "--to", "0:38"]
     assert cli.main(args + ["--stop-after", "ingest"]) == 0
     (work,) = root.iterdir()
@@ -105,6 +106,7 @@ def test_pipeline_with_formats_translation_logo_and_focus(tmp_path, fake_claude)
     assert len(srts) == 2 and "Das ist Satz" in srts[0] and "[EN]" in srts[1]
     ass = next((work / "clips").glob("*/9x16/captions.ass")).read_text()
     assert "[EN]" in ass and "Title,,0,0,0,,{\\fad(150,300)}[EN]" in ass  # translated lines and title
+    assert "Watermark,,0,0,0,,@clipper (test)" in ass  # braces can't start an override tag
     prompts = [json.loads(l)["prompt"] for l in fake_claude.read_text().splitlines()]
     assert any("looking for: the best bits" in p for p in prompts)
 
