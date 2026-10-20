@@ -267,10 +267,14 @@ def _escape(text: str) -> str:
     return text.replace("\\", "⧵").replace("{", "(").replace("}", ")").replace("\n", " ")
 
 
+TEXT_STYLES = {"top": (8, 250), "middle": (5, 0), "bottom": (2, MARGIN_LOWER + 230)}  # alignment, margin
+
+
 def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS["bold"],
               keywords: list[str] | None = None, title: str | None = None, fmt: Format = VERTICAL,
-              watermark: Watermark | None = None) -> str:
-    """words have times in the finished clip."""
+              watermark: Watermark | None = None, texts: list[dict] | None = None) -> str:
+    """words have times in the finished clip. texts: your own text cards ({"text", "start", "end",
+    "position"}), with times in the finished clip."""
     emphasized = keyword_positions(words, keywords or [])
     index = {id(w): i for i, w in enumerate(words)}
     hi, em, base = (f"\\c{tag_color(c)}" for c in (style.highlight, style.emphasis, style.color))
@@ -311,6 +315,17 @@ def build_ass(words: list[dict], duration: float, style: CaptionStyle = PRESETS[
     if watermark:
         styles.append(_watermark_style_line(style, watermark, fmt))
         events.append(f"Dialogue: 2,{_ts(0)},{_ts(duration)},Watermark,,0,0,0,,{_escape(watermark.text)}")
+    used = {t.get("position", "top") for t in texts or []}
+    for pos in TEXT_STYLES:
+        if pos in used:
+            align, margin = TEXT_STYLES[pos]
+            styles.append(_title_style_line(style, f"Text_{pos}", 58, align, fmt.v(margin)))
+    for t in texts or []:
+        a, b = max(0.0, float(t["start"])), min(duration, float(t["end"]))
+        if b - a < 0.05 or not str(t.get("text", "")).strip():
+            continue
+        events.append(f"Dialogue: 3,{_ts(a)},{_ts(b)},Text_{t.get('position', 'top')},,0,0,0,,"
+                      f"{{\\fad(120,200)}}{_escape(str(t['text']))}")
     return _header(styles, fmt) + "\n".join(events) + "\n"
 
 
@@ -329,11 +344,12 @@ def _write_if_changed(path: Path, text: str) -> Path:
 
 def make_captions(words: list[dict], duration: float, out_dir: Path, style: CaptionStyle, fmt: Format = VERTICAL,
                   title: str | None = None, cover_title: str = "", keywords: list[str] | None = None,
-                  watermark: Watermark | None = None) -> Path:
+                  watermark: Watermark | None = None, texts: list[dict] | None = None) -> Path:
     """Write captions.ass (and cover.ass) for one clip in one format. `words` have times in the finished
     clip. Cheap, so it's rebuilt every run; unchanged files are left alone so renders stay cached."""
     _write_if_changed(out_dir / "cover.ass", build_cover_ass(cover_title or title or "", style, fmt))
-    return _write_if_changed(out_dir / "captions.ass", build_ass(words, duration, style, keywords, title, fmt, watermark))
+    return _write_if_changed(out_dir / "captions.ass",
+                             build_ass(words, duration, style, keywords, title, fmt, watermark, texts))
 
 
 def srt_lines(words: list[dict], max_chars: int = 42) -> list[tuple[float, float, str]]:

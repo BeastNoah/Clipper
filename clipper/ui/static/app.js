@@ -206,8 +206,8 @@ function settingsFields(opts, keys) {
       ["turbo (accurate)", "large-v3", "medium", "small", "none (reuse transcript)"]),
     caption_style: () => sel("caption_style", "Caption style", C.caption_styles),
     caption_position: () => sel("caption_position", "Caption position", ["lower", "middle"]),
-    layout: () => sel("layout", "Two people", C.layouts,
-      ["auto", "follow the speaker", "split screen", "main person only"]),
+    layout: () => sel("layout", "Framing", C.layouts,
+      ["auto", "follow the speaker", "split screen", "main person only", "whole frame (no cropping)"]),
     jump_cuts: () => sel("jump_cuts", "Jump cuts", C.jump_cuts, ["off", "pauses only", "pauses + filler words"]),
     encoder: () => sel("encoder", "Encoder", C.encoders, ["x264 (best quality)", "VideoToolbox (fast, Mac)", "auto (VideoToolbox on a Mac)"]),
     download: () => sel("download", "Video", ["sections", "full"], ["only the clips' parts (fast)", "convert the whole video first"]),
@@ -941,8 +941,10 @@ function clipCard(v, c) {
     h("div", { class: "row", style: "gap:8px" }, download, coverLink,
       ...(c.srt || []).map(f => h("a", { class: "btn ghost", href: media(f), download: f, title: "Caption file" },
         f.split(".").length > 2 ? `Captions (${f.split(".").slice(-2, -1)[0]})` : "Captions")),
+      h("a", { class: "btn", href: `#/video/${v.id}/edit/${c.rank}`, title: "Change Claude's edit: the cut, framing, captions, text, B-roll, music" }, "Edit"),
       h("button", { class: "btn ghost", onclick: () => openCaptionEditor(v, c, editor, player) }, "Fix captions"),
       h("button", { class: "btn", onclick: () => openPublish(v, c, publishBox) }, "Publish")),
+    c.edited ? h("div", { class: "small muted" }, "Rendered with your changes from the editor.") : null,
     posted.length ? h("div", { class: "posted-list" }, posted.map(([name, r]) =>
       r.url ? h("a", { class: "posted", href: r.url, target: "_blank", rel: "noopener" }, `Posted to ${PLATFORM_NAMES[name]}`)
             : h("span", { class: "posted" }, `Posted to ${PLATFORM_NAMES[name]}`))) : null,
@@ -1211,8 +1213,16 @@ async function publishForm(v, c, box, area, acct, defaults, again) {
 // Router
 
 async function route() {
+  const ed = location.hash.match(/^#\/video\/([a-z0-9-]+)\/edit\/(\d+)/);
   const m = location.hash.match(/^#\/video\/([a-z0-9-]+)(?:\/(clips|review))?/);
   document.querySelectorAll("[data-nav]").forEach(a => a.classList.toggle("active", !m));
+  if (S.route?.name === "editor" && !ed) closeEditor();
+  if (ed) {
+    S.route = { name: "editor", id: ed[1], rank: ed[2] };
+    S.video = null;
+    await openEditor(ed[1], ed[2]);
+    return;
+  }
   if (m) {
     const same = S.route?.name === "video" && S.route.id === m[1];
     S.route = { name: "video", id: m[1] };

@@ -44,7 +44,7 @@ SECOND_PERSON = 0.6     # a second face at least this big (relative to the main 
 MIN_TURN_SAMPLES = 5    # a speaker must talk ~1s before the camera cuts to them
 BANTER_WINDOW_S = 6.0   # two or more changes of speaker within this window counts as back-and-forth
 MIN_LAYOUT_S = 4.0      # don't switch between split screen and single framing more often than this
-LAYOUTS = ("auto", "follow", "split", "main")
+LAYOUTS = ("auto", "follow", "split", "main", "fit")
 
 YUNET_URL = ("https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/"
              "face_detection_yunet_2023mar.onnx")
@@ -327,7 +327,7 @@ def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: 
     """Framing for frames a..b-1 of one shot: ("fit", None), or a mode with one value per frame."""
     n = len(samples)
     found = people(build_tracks(samples), n) if n else []
-    if not found:
+    if not found or layout == "fit":
         return "fit", None, {}
 
     def centers(t: Track) -> list[float | None]:
@@ -383,8 +383,19 @@ def plan_shot(samples: list[list[tuple]], frames: list[int], a: int, b: int, W: 
     return "follow+split", mixed, info
 
 
+def layout_at(layouts: list[tuple[float, float, str]], t: float, default: str) -> str:
+    """The framing asked for at t seconds into the clip: a per-segment override, else the default."""
+    for a, b, layout in layouts:
+        if a <= t < b:
+            return layout
+    return default
+
+
 def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict] | None = None,
-            layout: str = "auto", fmt: Format = VERTICAL) -> dict:
+            layout: str = "auto", fmt: Format = VERTICAL,
+            layouts: list[tuple[float, float, str]] | None = None) -> dict:
+    """layouts: (from, to, layout) in seconds from `start`, where you chose the framing yourself; a shot is
+    split at their edges and each piece framed as asked."""
     import cv2
 
     W, H = meta["width"], meta["height"]
@@ -418,10 +429,15 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
     if n == 0:
         raise ClipperError(f"No video frames between {start:.1f}s and {end:.1f}s")
     cuts = detect_cuts(changes, fps)
-    bounds = [0, *cuts, n]
+    edges = {min(n, max(0, round(t * fps))) for a_, b_, _ in layouts or [] for t in (a_, b_)}
+    bounds = sorted({0, *cuts, n, *edges})
     shots, xs = [], [None] * n
     for a, b in zip(bounds, bounds[1:]):
         if b <= a:
+            continue
+        shot_layout = layout_at(layouts or [], (a + b) / 2 / fps, layout)
+        if shot_layout == "fit":  # the whole frame, whatever is in it
+            shots.append({"start": a, "end": b, "mode": "fit", "chosen": "fit"})
             continue
         idx = [k for k, f in enumerate(sample_frames) if a <= f < b]
         frames = [sample_frames[k] for k in idx]
@@ -433,9 +449,11 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
             xs[a:b] = [xs[a - 1]] * (b - a)
             shots.append({"start": a, "end": b, "mode": shots[-1]["mode"], "inherited": True})
             continue
-        mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, layout, speaking, fmt)
+        mode, values, info = plan_shot(shot_samples, frames, a, b, W, H, cw, fps, shot_layout, speaking, fmt)
         if values is not None:
             xs[a:b] = values
+        if shot_layout != layout:
+            info = {**info, "chosen": shot_layout}
         shots.append({"start": a, "end": b, "mode": mode, **info})
 
     framed = sum(s["end"] - s["start"] for s in shots if s["mode"] != "fit")
@@ -447,7 +465,7 @@ def analyze(video: Path, meta: dict, start: float, end: float, words: list[dict]
 
 def reframe(work: Path, meta: dict, clip: dict, out_dir: Path, words: list[dict] | None = None,
             layout: str = "auto", force: bool = False, src: "ClipVideo | None" = None,
-            fmt: Format = VERTICAL) -> dict:
+            fmt: Format = VERTICAL, layouts: list[tuple[float, float, str]] | None = None) -> dict:
     from .ingest import ClipVideo
 
     src = src or ClipVideo(work / "video.mp4", 0.0, meta["width"], meta["height"], meta["fps"])
@@ -455,10 +473,12 @@ def reframe(work: Path, meta: dict, clip: dict, out_dir: Path, words: list[dict]
     params = {"version": REFRAME_VERSION, "start": clip["start"], "end": clip["end"], "layout": layout,
               "speech": fingerprint(speech), "video": src.key(), "format": fmt.name,
               "detector": FaceDetector.kind_available()}  # a result from the Haar fallback isn't kept for good
+    if layouts:  # only when you chose framings yourself, so earlier results still count
+        params["layouts"] = [[a, b, l] for a, b, l in layouts]
     # The file may be a section of the video: work in its own time, which starts at src.offset.
     local = [{**w, "s": w["s"] - src.offset, "e": w["e"] - src.offset} for w in words or []]
     dims = {"width": src.width, "height": src.height, "fps": src.fps}
     return cached(out_dir / "reframe.json", params,
                   lambda: analyze(src.path, dims, clip["start"] - src.offset, clip["end"] - src.offset,
-                                  local, layout, fmt),
+                                  local, layout, fmt, layouts),
                   force=force, label=f"reframe #{clip['rank']} ({fmt.name})")

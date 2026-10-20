@@ -79,6 +79,10 @@ class Piece:
 # ---------------------------------------------------------------------------------------------
 # Extras drawn on the frames
 
+def _file_key(path: Path) -> str:
+    return hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+
+
 @dataclass
 class Look:
     zoom: list[tuple[float, float]] = field(default_factory=list)  # output-time windows to punch in on
@@ -86,14 +90,99 @@ class Look:
     logo_position: str = "top-right"
     opacity: int = 90            # percent, for the logo
     progress: str | None = None  # colour of a progress bar along the top, e.g. "#FFE600"
+    broll: list[tuple[float, float, Path]] = field(default_factory=list)  # output-time windows showing a picture or video
+    fade_between: float = 0.0    # seconds of a dip to black at each join between the clip's parts
+    fade_in: float = 0.0
+    fade_out: float = 0.0
+    music: tuple[Path, int] | None = None  # a music file and its volume in percent, mixed under the sound
 
     def key(self) -> dict:
-        logo = hashlib.sha1(self.logo.read_bytes()).hexdigest()[:12] if self.logo else None
+        logo = _file_key(self.logo) if self.logo else None
         key = {"zoom": [[round(a, 2), round(b, 2)] for a, b in self.zoom], "logo": logo,
                "logo_position": self.logo_position, "progress": self.progress}
         if self.opacity != 90:  # only when changed, so renders from before the setting existed still count
             key["opacity"] = self.opacity
+        if self.broll:
+            key["broll"] = [[round(a, 2), round(b, 2), _file_key(p)] for a, b, p in self.broll]
+        if self.fade_between or self.fade_in or self.fade_out:
+            key["fades"] = [self.fade_between, self.fade_in, self.fade_out]
+        if self.music:
+            key["music"] = [_file_key(self.music[0]), self.music[1]]
         return key
+
+
+IMAGE_TYPES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tif", ".tiff"}
+
+
+def asset_frames(path: Path, duration: float, fmt: Format, fps: Fraction):
+    """Frames of a picture (held) or a video (looped) for `duration` seconds, letterboxed to the output size."""
+    cmd = ["ffmpeg", "-v", "error", "-nostdin"]
+    if path.suffix.lower() in IMAGE_TYPES:
+        cmd += ["-loop", "1", "-framerate", str(fps), "-i", str(path)]
+    else:
+        cmd += ["-stream_loop", "-1", "-i", str(path)]
+    cmd += ["-t", f"{duration:.3f}", "-an", "-sn",
+            "-vf", f"fps={fps},scale={fmt.width}:{fmt.height}:force_original_aspect_ratio=decrease,"
+                   f"pad={fmt.width}:{fmt.height}:(ow-iw)/2:(oh-ih)/2:color=black,format=bgr24",
+            "-f", "rawvideo", "-pix_fmt", "bgr24", "-"]
+    size = fmt.width * fmt.height * 3
+    with tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
+        try:
+            while True:
+                buf = proc.stdout.read(size)
+                if len(buf) < size:
+                    break
+                yield np.frombuffer(buf, np.uint8).reshape(fmt.height, fmt.width, 3)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.stdout.close()
+            code = proc.wait()
+        if code != 0:
+            err.seek(0)
+            raise ClipperError(f"ffmpeg could not read {path.name}:\n" + err.read().decode(errors="replace")[-1500:])
+
+
+class BRoll:
+    """Pictures or videos shown over stretches of the finished clip (the captions still go on top)."""
+
+    def __init__(self, windows: list[tuple[float, float, Path]], fmt: Format, fps: Fraction):
+        self.windows = sorted(windows)
+        self.fmt, self.fps = fmt, fps
+        self.current: tuple | None = None  # (index, frames, last frame)
+
+    def frame(self, t: float) -> "np.ndarray | None":
+        for k, (a, b, path) in enumerate(self.windows):
+            if a <= t < b:
+                if self.current is None or self.current[0] != k:
+                    self.close()
+                    self.current = [k, asset_frames(path, b - a, self.fmt, self.fps), None]
+                try:
+                    self.current[2] = next(self.current[1])
+                except StopIteration:
+                    pass  # shorter than asked: hold the last frame
+                return self.current[2]
+        self.close()
+        return None
+
+    def close(self) -> None:
+        if self.current is not None:
+            self.current[1].close()
+            self.current = None
+
+
+def fade_factor(t: float, duration: float, joins: list[float], look: Look) -> float:
+    """How bright the frame at output time t is: dips to black at the joins and at the ends, if asked."""
+    f = 1.0
+    if look.fade_in > 0:
+        f = min(f, t / look.fade_in)
+    if look.fade_out > 0:
+        f = min(f, (duration - t) / look.fade_out)
+    if look.fade_between > 0:
+        for j in joins:
+            f = min(f, abs(t - j) / look.fade_between)
+    return min(max(f, 0.0), 1.0)
 
 
 def read_logo(path: Path) -> np.ndarray:
@@ -236,8 +325,9 @@ def vertical_frame(frame: np.ndarray, v, cw: int, fmt: Format = VERTICAL, zoom: 
 # ---------------------------------------------------------------------------------------------
 # Encoding
 
-def _audio_filter(pieces: list[Piece]) -> list[str]:
-    """Join the kept parts of the audio (input n + 1 is piece n), with 10 ms fades so the cuts don't click."""
+def _audio_filter(pieces: list[Piece], music: tuple[Path, int] | None = None, duration: float = 0.0) -> list[str]:
+    """Join the kept parts of the audio (input n + 1 is piece n), with 10 ms fades so the cuts don't click.
+    With music (the input after the pieces), it is mixed in underneath at its volume and faded out at the end."""
     parts, labels = [], []
     for n, piece in enumerate(pieces):
         for i, (a, b) in enumerate(piece.edit.segments):
@@ -246,7 +336,14 @@ def _audio_filter(pieces: list[Piece]) -> list[str]:
                          f"afade=t=in:d=0.01,afade=t=out:st={fade_out:.4f}:d=0.01[a{n}_{i}]")
             labels.append(f"[a{n}_{i}]")
     parts.append(f"{''.join(labels)}concat=n={len(labels)}:v=0:a=1[aout]")
-    return ["-filter_complex", ";".join(parts), "-map", "[aout]"]
+    out = "[aout]"
+    if music:
+        fade = min(1.5, duration / 2)
+        parts.append(f"[{len(pieces) + 1}:a]atrim=end={duration:.3f},asetpts=PTS-STARTPTS,"
+                     f"volume={music[1] / 100:.3f},afade=t=out:st={max(0.0, duration - fade):.3f}:d={fade:.3f}[mus]")
+        parts.append("[aout][mus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[amix]")
+        out = "[amix]"
+    return ["-filter_complex", ";".join(parts), "-map", out]
 
 
 def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, enc_args: list[str],
@@ -256,8 +353,10 @@ def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, e
     inputs = []
     for p in pieces:  # each piece's stretch, in its video file's own time
         inputs += ["-ss", f"{p.start - p.src.offset:.3f}", "-t", f"{p.end - p.start:.3f}", "-i", str(p.src.path.resolve())]
-    single = len(pieces) == 1 and pieces[0].edit.is_identity
-    audio = ["-map", "1:a:0"] if single else _audio_filter(pieces)
+    if look.music:
+        inputs += ["-stream_loop", "-1", "-i", str(look.music[0].resolve())]
+    single = len(pieces) == 1 and pieces[0].edit.is_identity and not look.music
+    audio = ["-map", "1:a:0"] if single else _audio_filter(pieces, look.music, duration)
     cmd = [
         "ffmpeg", "-y", "-v", "error", "-nostdin",
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{fmt.width}x{fmt.height}", "-framerate", str(fps),
@@ -272,6 +371,12 @@ def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, e
     total = sum(b - a for p in pieces for a, b in p.edit.frame_ranges(float(fps)))
     cover_index = min(total - 1, round(COVER_AT * float(fps)))
     overlay = Overlay(look, fmt)
+    broll = BRoll(look.broll, fmt, fps) if look.broll else None
+    joins, at = [], 0.0  # where one part of the clip ends and the next begins, in output time
+    for p in pieces[:-1]:
+        at += p.edit.duration
+        joins.append(at)
+    fades = look.fade_between > 0 or look.fade_in > 0 or look.fade_out > 0
     progress = Progress(f"render #{clip['rank']} ({fmt.name})", total)
     with tempfile.TemporaryFile() as err:
         # Run from the clip folder so the subtitle path needs no filter-graph escaping.
@@ -291,8 +396,17 @@ def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, e
                             break
                         if i < keep[r][0]:
                             continue  # cut out by a jump cut
-                        zoom = zoom_at(written / float(fps), look.zoom) if look.zoom else 1.0
+                        t_out = written / float(fps)
+                        zoom = zoom_at(t_out, look.zoom) if look.zoom else 1.0
                         img = vertical_frame(frame, xs[min(i, len(xs) - 1)] if xs else None, cw, fmt, zoom)
+                        over = broll.frame(t_out) if broll else None
+                        if over is not None:
+                            img = over.copy()
+                        if fades:
+                            f = fade_factor(t_out, duration, joins, look)
+                            if f < 0.999:
+                                import cv2
+                                img = cv2.convertScaleAbs(img, alpha=f)
                         if written == cover_index:
                             import cv2
                             cv2.imwrite(str(cover_frame), img)  # before the logo and bar: the cover stays clean
@@ -310,6 +424,8 @@ def _encode(meta: dict, clip: dict, pieces: list[Piece], ass: Path, out: Path, e
             enc.wait()
             raise
         finally:
+            if broll:
+                broll.close()
             Progress.clear_line()
         if enc.wait() != 0:
             err.seek(0)

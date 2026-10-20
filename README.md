@@ -92,6 +92,42 @@ transcript model, and 1.6 GB for `turbo`, the caption model) and OpenCV's YuNet 
   it plays, and clicking a line's time (or Ctrl+Enter while typing in it) plays just that line, so
   you can read along and catch mistakes. Changed lines are marked; on saving, the clip is rendered
   again with your text.
+- **Edit:** opens a clip in the editor, where Claude's and clipper's proposed edit is the starting
+  point and you change what you like (see below). **Apply changes** renders the clip again.
+
+### The editor
+
+Press **Edit** on a finished clip. The screen has the clip's script on the left, a preview in the
+middle, tools on the right and a timeline at the bottom. Everything you change is kept per clip in
+`work/<video_id>/edits/`, so a later re-render (new caption style, a fixed word) keeps your changes,
+and **Reset to Claude's proposal** brings the original back.
+
+- **Script:** the words of the clip in playing order. Claude's keywords are green; click any word to
+  highlight it in the captions (and punch in on it), or click a green one to drop it. A `•` marks a
+  pause or filler word clipper cuts out; click it to select that cut. **Add a section** picks
+  sentences from the transcript: a stretch from before the clip is played first (a set-up), one after
+  it extends the clip.
+- **Preview:** the clip as it will be rendered: the framing (the window that follows the speaker,
+  the split screen, or the whole frame), the captions with the spoken word lit up, the title card,
+  your text cards and B-roll. Above it, **Layout** sets the framing of the selected segment
+  (Auto, Fill, Split, Fit) and **Track** switches between following the people in the picture and
+  showing the whole frame.
+- **Timeline:** the top track holds your text cards, B-roll and extra punch-ins (drag to move or
+  stretch them). The video track shows frames, the framing per segment ("Fill", "Split", "Fit") and
+  the jump cuts as hatched stretches: click one and press **Keep this pause** to leave it in. Click a
+  segment to select it; **split** (or `S`) cuts the segment at the playhead so each piece can get its
+  own framing, and **delete** (or `Delete`) cuts the selected segment out of the clip. The loudness
+  of the sound runs underneath. Space plays and pauses; the time shown is where you are in the
+  finished clip, after the cuts.
+- **Tools:** *AI enhance* shows what Claude proposed (score, hook, keywords, how many pauses are cut)
+  with switches for the jump cuts, the framing of the whole clip, the punch-ins and the title card.
+  *Caption* sets the caption style and position and lets you fix misheard words in the script.
+  *Text* adds words on the picture. *Upload* holds the pictures, videos and music you upload.
+  *Transitions* chooses a hard cut or a dip to black between the parts of a clip, and fades at the
+  ends. *AI hook* lets you change the title the clip opens with, or asks Claude for five other
+  angles. *B-Roll* shows an uploaded picture or video over the clip for a few seconds (the captions
+  stay on top). *Music* mixes an uploaded track under the sound at the volume you set, faded out at
+  the end.
 
 ### On your phone
 
@@ -138,7 +174,7 @@ way back to the computer; then use the computer's Tailscale address in the link.
 | `--watermark TEXT`, `--watermark-position` | bottom-left | your own text on every clip, e.g. `--watermark @yourname`; in the logo's corner it sits next to the logo |
 | `--watermark-opacity` | 90 | how solid the watermark text and the logo are, in percent (10-100) |
 | `--jump-cuts` | `on` | `on` cuts long pauses and filler words ("um", "äh"), `pauses` only pauses, `off` nothing |
-| `--layout` | `auto` | two people in a shot: `follow` whoever talks, `split` screen, `auto` (split during back-and-forth, follow otherwise), `main` person only |
+| `--layout` | `auto` | two people in a shot: `follow` whoever talks, `split` screen, `auto` (split during back-and-forth, follow otherwise), `main` person only; `fit` never crops (the whole frame on a blurred background) |
 | `--encoder` | `auto` | `auto` uses the Mac's hardware encoder (`videotoolbox`: much faster, slightly bigger files) when there is one, else `x264` (best quality per MB) |
 | `--crf` / `--preset` | 20 / medium | x264 quality and speed |
 | `--no-posts` | | don't write post text |
@@ -254,12 +290,14 @@ work/<video_id>/
   clips.json           Claude's picks
   review.json          your picks from the web interface
   posts.json           post text per clip
+  edits/<clip id>.json your changes to a clip from the editor (and <clip id>.hooks.json, Claude's hook ideas)
   clips/<start>-<end>/ per clip: section.mp4 (just this part of the video), words.json,
                        words_edited.json (your caption fixes), and per format (9x16/, 1x1/, …):
                        reframe.json, captions.ass, clip.mp4, cover.jpg
   clips/<start>-<end>+<id>/  a clip with earlier parts: its captions, caption fixes and render
                        (each part's section, words and framing are in the part's own folder)
   output/              the finished clips, covers, caption files, post text and clips.json
+work/_uploads/         files uploaded through the web interface (videos to clip, logos, B-roll, music)
 ```
 
 Per-clip results are stored by time range, so a clip that's still selected after you change

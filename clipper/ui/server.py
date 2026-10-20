@@ -28,25 +28,32 @@ import traceback
 import uuid
 import webbrowser
 from dataclasses import dataclass, field
+from fractions import Fraction
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from .. import publish as pub
+from ..audio import FRAME as LOUDNESS_FRAME
+from ..audio import Loudness
 from ..captions import PRESETS
 from ..edit import MODES as JUMP_CUT_MODES
-from ..formats import SIZES
+from ..edit import plan_cuts
+from ..edits import SHOT_LAYOUTS, TEXT_POSITIONS, TRANSITIONS, ClipEdits, check_assets, load_edits, save_edits
+from ..formats import SIZES, get_format
+from ..hooks import load_hooks, suggest_hooks
 from ..ingest import local_source
 from ..pipeline import (
-    Options, caption_lines, clip_dir_for, edited_words, find_new_clips, load_video, process, produce_reviewed, rerender,
-    save_caption_lines,
+    Options, caption_lines, claude_factory, clip_dir_for, edited_words, find_new_clips, load_video, part_words, parts_of,
+    process, produce_reviewed, rerender, save_caption_lines,
 )
 from ..reframe import LAYOUTS
-from ..render import ENCODERS
-from ..select import split_sentences
+from ..render import ENCODERS, IMAGE_TYPES
+from ..select import make_clip, split_sentences, timeline_for
+from ..transcribe import words_in
 from ..trending import TrendingLoader, load_creators, save_creators
-from ..util import Cancelled, ClipperError, read_json, set_reporter
+from ..util import Cancelled, ClipperError, read_json, set_reporter, write_json
 
 STATIC = Path(__file__).with_name("static")
 COOKIE = "clipper_key"
@@ -56,6 +63,10 @@ LOCKED_PAGE = """<!doctype html><meta name="viewport" content="width=device-widt
 scan the QR code shown in the terminal (or under <b>Phone</b> in clipper there), or type the link
 printed next to it.</p></body>"""
 VIDEO_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
+CLIP_DIR = re.compile(r"^\d{8}-\d{8}(\+[0-9a-f]{8})?$")   # a clip's folder under work/<video>/clips/
+UPLOAD_ID = re.compile(r"^[0-9a-f]{12}$")
+AUDIO_TYPES = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac", ".aiff", ".aif"}
+VIDEO_TYPES = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 MAX_LOG = 400
 MAX_BODY = 10 << 20  # JSON requests; uploads go through PUT
 
@@ -163,6 +174,7 @@ def choices() -> dict:
         "caption_styles": list(PRESETS), "layouts": list(LAYOUTS), "jump_cuts": list(JUMP_CUT_MODES),
         "encoders": list(ENCODERS), "models": ["opus", "sonnet", "haiku"], "formats": list(SIZES),
         "whisper_models": ["tiny", "base", "small", "medium", "large-v3", "turbo"],
+        "shot_layouts": list(SHOT_LAYOUTS), "text_positions": list(TEXT_POSITIONS), "transitions": list(TRANSITIONS),
     }
 
 
@@ -211,18 +223,134 @@ def source_video(work: Path) -> Path | None:
     return src if src and src.is_file() else None
 
 
-def frame_jpeg(work: Path, t: float, width: int = 360) -> Path:
-    video = source_video(work)
+def frame_jpeg(work: Path, t: float, width: int = 360, clip_dir: str | None = None) -> Path:
+    """A frame of the video at t (video time): from the whole video, or from a clip's section when the whole
+    video isn't on this computer (only the clips' parts were fetched)."""
+    video, seek = source_video(work), t
+    section = work / "clips" / clip_dir / "section.mp4" if clip_dir and CLIP_DIR.match(clip_dir) else None
+    if section is not None and section.exists() and (video is None or clip_dir):
+        info = read_json(section.with_suffix(".json")) if section.with_suffix(".json").exists() else {}
+        video, seek = section, max(0.0, t - float(info.get("offset", 0.0)))
     if video is None:
         return work / "thumb.jpg"  # only the audio was downloaded: use the video's thumbnail
     thumbs = work / "thumbs"
     thumbs.mkdir(exist_ok=True)
     out = thumbs / f"{int(t * 1000)}_{width}.jpg"
     if not out.exists():
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{t:.3f}", "-i", str(video),
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{seek:.3f}", "-i", str(video),
                         "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "4", str(out)],
                        capture_output=True, check=False)
     return out
+
+
+def asset_kind(path: Path) -> str | None:
+    ext = path.suffix.lower()
+    return "image" if ext in IMAGE_TYPES else "video" if ext in VIDEO_TYPES else "audio" if ext in AUDIO_TYPES else None
+
+
+def list_assets(root: Path) -> list[dict]:
+    """Everything uploaded through the page (logos, pictures and videos for B-roll, music), newest first."""
+    out = []
+    uploads = root / "_uploads"
+    if not uploads.is_dir():
+        return out
+    for folder in uploads.iterdir():
+        if not (folder.is_dir() and UPLOAD_ID.match(folder.name)):
+            continue
+        for f in folder.iterdir():
+            kind = asset_kind(f)
+            if f.is_file() and kind and re.match(r"^[\w.-]+$", f.name):
+                out.append({"name": f.name, "path": str(f), "kind": kind, "size": f.stat().st_size,
+                            "url": f"/media/upload/{folder.name}/{f.name}", "modified": f.stat().st_mtime})
+    return sorted(out, key=lambda a: -a["modified"])
+
+
+# ---------------------------------------------------------------------------------------------
+# The clip editor
+
+def _plan_shots(plan: dict, start: float, fps: float) -> list[dict]:
+    return [{"start": round(start + sh["start"] / fps, 3), "end": round(start + sh["end"] / fps, 3),
+             "mode": sh["mode"], "chosen": sh.get("chosen")} for sh in plan["shots"]]
+
+
+def editor_data(work: Path, clip: dict, loud: Loudness | None, jump_cuts: str | None = None) -> dict:
+    """Everything the editor shows for one clip: its parts with their words, clipper's jump cuts and framing,
+    the sound's loudness for the timeline, where to play each part from, and your own changes so far."""
+    meta = read_json(work / "meta.json")
+    fps = float(Fraction(meta["fps"]))
+    transcript = read_json(work / "transcript.json")["result"]
+    edits = load_edits(work, clip)
+    review = read_json(work / "review.json") if (work / "review.json").exists() else {}
+    options = review.get("options") or {}
+    mode = jump_cuts if jump_cuts in JUMP_CUT_MODES else edits.jump_cuts or options.get("jump_cuts") or "on"
+    layout = edits.layout or options.get("layout") or "auto"
+    fmt = get_format((options.get("formats") or ["9:16"])[0])
+    fixed = edited_words(work, clip)
+    parts_all = parts_of(clip)
+    parts = []
+    for part in parts_all:
+        pdir = clip_dir_for(work, part)
+        words = part_words(work, part)
+        if fixed is not None:
+            words = fixed if len(parts_all) == 1 else words_in(fixed, part["start"], part["end"])
+        words = [{"w": w["w"].strip(), "s": round(w["s"], 3), "e": round(w["e"], 3)} for w in words if w["w"].strip()]
+        keep = plan_cuts(words, part["start"], part["end"], fps, mode, loud.is_quiet if loud else None)
+        removed, at = [], 0.0
+        for a, b in keep:
+            if a > at + 1e-6:
+                removed.append([round(part["start"] + at, 3), round(part["start"] + a, 3)])
+            at = b
+        if part["end"] - part["start"] > at + 1e-6:
+            removed.append([round(part["start"] + at, 3), round(part["end"], 3)])
+        plan_path = pdir / fmt.tag / "reframe.json"
+        plan = read_json(plan_path)["result"] if plan_path.exists() else None
+        media = None
+        info_path, section = pdir / "section.json", pdir / "section.mp4"
+        if section.exists() and info_path.exists():
+            media = {"url": f"/media/{work.name}/clips/{pdir.name}/section.mp4", "offset": read_json(info_path)["offset"]}
+        elif (work / "video.mp4").exists():
+            media = {"url": f"/media/{work.name}/video.mp4", "offset": 0.0}
+        elif local_source(meta) and local_source(meta).is_file():
+            media = {"url": f"/media/{work.name}/source", "offset": 0.0}
+        wave = []
+        if loud is not None:
+            w = loud.window(part["start"], part["end"])
+            lo, hi = loud.floor, max(loud.floor + 1.0, float(w.max()) if len(w) else loud.floor + 1.0)
+            wave = [round(min(1.0, max(0.0, (float(v) - lo) / (hi - lo))), 2) for v in w]
+        parts.append({"dir": pdir.name, "start": part["start"], "end": part["end"], "si": part.get("si"), "ei": part.get("ei"),
+                      "words": words, "removed": removed, "media": media, "wave": wave, "wave_step": LOUDNESS_FRAME,
+                      "plan": {"width": plan["width"], "height": plan["height"], "crop_w": plan["crop_w"], "fps": fps,
+                               "shots": _plan_shots(plan, part["start"], fps), "x": plan["x"]} if plan else None})
+    return {"clip": clip, "parts": parts, "edits": edits.to_dict(), "jump_cuts": mode, "layout": layout,
+            "format": fmt.name, "options": options, "hooks": load_hooks(work, clip),
+            "sentences": [{"i": s.i, "start": round(s.start, 2), "end": round(s.end, 2), "text": s.text}
+                          for s in split_sentences(transcript["words"])]}
+
+
+def reshape_clip(work: Path, clip: dict, si: int, ei: int, before: list) -> dict:
+    """Change which sentences a clip covers (and the earlier parts played first) from the editor; the clip's
+    record in output/clips.json is rebuilt the way the review screen builds it."""
+    meta = read_json(work / "meta.json")
+    tl = timeline_for(read_json(work / "transcript.json")["result"], meta)
+    n = len(tl.sentences)
+    try:
+        si, ei = int(si), int(ei)
+        before = [(int(a), int(b)) for a, b in before or []]
+    except (TypeError, ValueError):
+        raise ClipperError("sections must be given as sentence numbers") from None
+    if not (0 <= si <= ei < n) or any(not (0 <= a <= b < si) for a, b in before):
+        raise ClipperError("a section must be whole sentences, and the ones played first must come before the clip")
+    base = {**clip, "keywords": clip.get("claude_keywords") or clip.get("keywords") or []}
+    new = make_clip(tl, clip["rank"], si, ei, base=base, title=clip.get("claude_title") or clip["title"], before=before)
+    for k in ("claude_title", "post", "file", "cover", "formats", "srt", "final_duration"):
+        if k in clip:
+            new[k] = clip[k]
+    if new.get("claude_title"):
+        new["title"] = clip["title"]
+    path = work / "output" / "clips.json"
+    clips = [new if c.get("rank") == clip["rank"] else c for c in read_json(path)]
+    write_json(path, clips)
+    return new
 
 
 # ---------------------------------------------------------------------------------------------
@@ -389,6 +517,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._oauth_callback(parts[1], qs)
         if parts[0] == "static" and len(parts) == 2 and re.match(r"^[\w.-]+$", parts[1]):
             return self._file(STATIC / parts[1])
+        if parts[0] == "media" and len(parts) == 4 and parts[1] == "upload":
+            if not (UPLOAD_ID.match(parts[2]) and re.match(r"^[\w.-]+$", parts[3])):
+                return self._error(404, "not found")
+            return self._file(self.app.root / "_uploads" / parts[2] / parts[3], cache=True)
         if parts[0] == "media" and len(parts) >= 3:
             work = self._work(parts[1])
             rel = parts[2:]
@@ -397,7 +529,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(src) if src else self._error(404, "not found")
             if work is None or not (rel in (["video.mp4"], ["audio.wav"], ["thumb.jpg"])
                                     or (len(rel) == 2 and rel[0] == "output"
-                                                              and re.match(r"^[\w.-]+$", rel[1]))):
+                                                              and re.match(r"^[\w.-]+$", rel[1]))
+                                    or (len(rel) == 3 and rel[0] == "clips" and CLIP_DIR.match(rel[1])
+                                                              and rel[2] == "section.mp4")):
                 return self._error(404, "not found")
             return self._file(work.joinpath(*rel))
         if parts[0] != "api":
@@ -431,6 +565,18 @@ class Handler(BaseHTTPRequestHandler):
                     return self._error(404, "no such clip")
                 return self._json({"accounts": pub.status(), "defaults": post_defaults(clip),
                                    "published": pub.published(work).get(clip["file"], {})})
+            if len(route) == 4 and route[2] == "edit":
+                clip = self.app.rendered_clip(work, route[3])
+                if clip is None:
+                    return self._error(404, "no such clip")
+                if not (work / "transcript.json").exists():
+                    return self._error(400, "this video hasn't been transcribed yet")
+                try:
+                    data = editor_data(work, clip, self.app.loudness(work), (qs.get("jump_cuts") or [None])[0])
+                except ClipperError as e:
+                    return self._error(400, str(e))
+                data["assets"] = list_assets(self.app.root)
+                return self._json(data)
             if route[2:] == ["frame"]:
                 try:
                     t = float((qs.get("t") or ["0"])[0])
@@ -438,9 +584,11 @@ class Handler(BaseHTTPRequestHandler):
                     t = math.nan
                 if not math.isfinite(t):
                     return self._error(400, "t must be a time in seconds")
-                return self._file(frame_jpeg(work, max(0.0, t)), cache=True)
+                return self._file(frame_jpeg(work, max(0.0, t), clip_dir=(qs.get("clip") or [None])[0]), cache=True)
         if route == ["accounts"]:
             return self._json(pub.status())
+        if route == ["assets"]:
+            return self._json(list_assets(self.app.root))
         if route == ["trending"]:
             return self._json(self.app.trending.state())
         if route == ["creators"]:
@@ -501,6 +649,30 @@ class Handler(BaseHTTPRequestHandler):
             except (ClipperError, ValueError, TypeError) as e:
                 return self._error(400, str(e))
             return self._json(job.public(), 201)
+        if len(parts) in (5, 6) and parts[:2] == ["api", "videos"] and parts[3] == "edit":
+            work = self._work(parts[2])
+            clip = self.app.rendered_clip(work, parts[4]) if work else None
+            if clip is None:
+                return self._error(404, "no such clip")
+            body = self._body()
+            try:
+                if parts[5:] == ["hooks"]:
+                    return self._json(self.app.hooks_job(work, clip, body.get("options") or {}).public(), 201)
+                if parts[5:]:
+                    return self._error(404, "not found")
+                edits = ClipEdits.from_dict(body.get("edits"))
+                check_assets(edits, [self.app.root / "_uploads"])
+                shape = body.get("parts")
+                if isinstance(shape, dict):
+                    clip = reshape_clip(work, clip, shape.get("si"), shape.get("ei"), shape.get("before"))
+                save_edits(work, clip, edits)
+                job = None
+                if body.get("render", True):
+                    job = self.app.make_job({"kind": "rerender", "video": work.name, "options": body.get("options") or {},
+                                             "label": f"Update clip {clip['rank']}"})
+            except (ClipperError, ValueError, KeyError, TypeError) as e:
+                return self._error(400, str(e))
+            return self._json({"edits": edits.to_dict(), "clip": clip, "job": job.public() if job else None}, 201)
         if len(parts) == 4 and parts[:2] == ["api", "accounts"]:
             return self._account_action(parts[2], parts[3])
         if parts == ["api", "trending", "refresh"]:
@@ -624,6 +796,26 @@ class App:
         self.logins = pub.Logins()
         self.key, self.phone_url = key, phone_url
         self.trending = TrendingLoader(root)
+        self._loudness: dict[str, tuple[float, Loudness | None]] = {}
+
+    def loudness(self, work: Path) -> Loudness | None:
+        """The video's loudness curve (for the timeline and the jump cuts), read once per video."""
+        path = work / "audio.wav"
+        stamp = path.stat().st_mtime if path.exists() else -1.0
+        got = self._loudness.get(work.name)
+        if got is None or got[0] != stamp:
+            got = (stamp, Loudness.from_work(work))
+            self._loudness[work.name] = got
+        return got[1]
+
+    def hooks_job(self, work: Path, clip: dict, options: dict) -> Job:
+        """Ask Claude for other titles to open a clip with (on the side queue: it never waits behind a render)."""
+        opts = Options.from_dict({**options, "work_dir": str(self.root)})
+        meta = read_json(work / "meta.json")
+
+        def run(job: Job) -> None:
+            suggest_hooks(work, meta, clip, claude_factory(opts, work))
+        return self.uploads.submit(Job("hooks", f"Hook ideas for clip {clip['rank']}: {clip['title']}", run, video=work.name))
 
     def make_job(self, body: dict) -> Job:
         opts = Options.from_dict({**body.get("options", {}), "work_dir": str(self.root)})
@@ -665,7 +857,7 @@ class App:
                 job.video = vid
                 rerender(work, opts)
             title = read_json(work / "meta.json").get("title") or vid
-            return self.jobs.submit(Job("render", f"Update clips: {title}", run, video=vid))
+            return self.jobs.submit(Job("render", f"{body.get('label') or 'Update clips'}: {title}", run, video=vid))
         if kind == "new_clips":
             vid = str(body.get("video") or "")
             work = self.root / vid
